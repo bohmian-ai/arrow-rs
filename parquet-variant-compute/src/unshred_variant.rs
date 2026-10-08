@@ -86,7 +86,12 @@ pub fn unshred_variant(array: &VariantArray) -> Result<VariantArray> {
     let mut row_builder = UnshredVariantRowBuilder::try_new_opt(array.inner())?
         .unwrap_or_else(UnshredVariantRowBuilder::null);
 
-    let mut value_builder = VariantValueArrayBuilder::new(array.len());
+    // The unshredded values hold the same bytes as the shredded columns plus small headers, so
+    // size the buffer once from the input instead of growing it row by row.
+    let mut value_builder = VariantValueArrayBuilder::with_capacity(
+        array.len(),
+        array.inner().get_buffer_memory_size(),
+    );
     for i in 0..array.len() {
         if array.is_null(i) {
             value_builder.append_null();

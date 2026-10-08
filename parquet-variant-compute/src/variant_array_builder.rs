@@ -289,8 +289,14 @@ pub struct VariantValueArrayBuilder {
 impl VariantValueArrayBuilder {
     /// Create a new `VariantValueArrayBuilder` with the specified row capacity
     pub fn new(row_capacity: usize) -> Self {
+        Self::with_capacity(row_capacity, 0)
+    }
+
+    /// Create a new `VariantValueArrayBuilder` that can hold `row_capacity` rows and
+    /// `byte_capacity` value bytes without reallocating.
+    pub fn with_capacity(row_capacity: usize, byte_capacity: usize) -> Self {
         Self {
-            value_builder: ValueBuilder::new(),
+            value_builder: ValueBuilder::with_capacity(byte_capacity),
             value_offsets: Vec::with_capacity(row_capacity),
             nulls: NullBufferBuilder::new(row_capacity),
         }
@@ -301,7 +307,9 @@ impl VariantValueArrayBuilder {
     /// Returns a [`BinaryViewArray`] containing the serialized variant values.
     /// This can be combined with existing metadata to create a complete [`VariantArray`].
     pub fn build(mut self) -> Result<BinaryViewArray, ArrowError> {
-        let value_buffer = self.value_builder.into_inner();
+        let mut value_buffer = self.value_builder.into_inner();
+        // The array keeps the whole allocation alive, so drop any unused capacity.
+        value_buffer.shrink_to_fit();
         let mut array = binary_view_array_from_buffers(value_buffer, self.value_offsets);
         if let Some(nulls) = self.nulls.finish() {
             let (views, buffers, _) = array.into_parts();

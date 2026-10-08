@@ -92,6 +92,11 @@ impl ValueBuilder {
     pub fn new() -> Self {
         Default::default()
     }
+
+    /// Construct a ValueBuffer whose underlying `Vec` can hold `bytes` without reallocating
+    pub fn with_capacity(bytes: usize) -> Self {
+        Self(Vec::with_capacity(bytes))
+    }
 }
 
 /// Macro to generate the match statement for each append_variant, try_append_variant, and
