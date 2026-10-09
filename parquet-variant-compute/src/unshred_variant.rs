@@ -57,7 +57,11 @@ use uuid::Uuid;
 ///
 /// # Errors
 /// - If the shredded data contains spec violations (e.g., field name conflicts)
+/// - If any row's metadata or value bytes are not a valid variant, including a value nested more
+///   than [`MAX_NESTING_DEPTH`] deep
 /// - If unsupported data types are encountered in typed_value columns
+///
+/// [`MAX_NESTING_DEPTH`]: parquet_variant::MAX_NESTING_DEPTH
 pub fn unshred_variant(array: &VariantArray) -> Result<VariantArray> {
     let nulls = array.nulls();
     let metadata = array.metadata_column();
@@ -65,14 +69,17 @@ pub fn unshred_variant(array: &VariantArray) -> Result<VariantArray> {
     let typed_value_col = array.typed_value_column();
 
     // Already unshredded: no data movement needed, but the output must annotate `value` as
-    // non-nullable per the spec. Inputs whose value-nulls are not all masked by the parent null
-    // buffer (spec-invalid "missing" rows) cannot be re-annotated and fall through to the row
-    // loop below, whose top-level sink materializes `Variant::Null` for such rows.
+    // non-nullable per the spec, and every row must still be a valid variant. Inputs whose
+    // value-nulls are not all masked by the parent null buffer (spec-invalid "missing" rows)
+    // cannot be re-annotated and fall through to the row loop below, whose top-level sink
+    // materializes `Variant::Null` for such rows.
     if typed_value_col.is_none() {
         if value_field_is_non_nullable(array) {
+            validate_unshredded(array)?;
             return Ok(array.clone());
         }
         if value_nulls_are_masked(value_col, nulls) {
+            validate_unshredded(array)?;
             return Ok(VariantArray::from_parts_unshredded(
                 metadata.clone(),
                 value_col.clone(),
@@ -113,6 +120,14 @@ pub fn unshred_variant(array: &VariantArray) -> Result<VariantArray> {
         Arc::new(value),
         nulls.cloned(),
     ))
+}
+
+/// Fully validates every non-null row of an unshredded array, which the fast path returns
+/// without decoding.
+fn validate_unshredded(array: &VariantArray) -> Result<()> {
+    (0..array.len())
+        .filter(|&i| array.is_valid(i))
+        .try_for_each(|i| array.try_value(i).map(drop))
 }
 
 fn value_field_is_non_nullable(array: &VariantArray) -> bool {

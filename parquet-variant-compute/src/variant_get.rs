@@ -226,7 +226,13 @@ fn shredded_get_path(
             // `typed_value`) -- so `unshred_variant` hits its clone fast-path, with nothing deeper
             // to shred. The builder then walks any remaining path per-row, emitting variant output
             // because `as_type` is `None`.
-            let target = if requested_variant {
+            //
+            // `try_value` below reads only primitive `typed_value`s, so nested shredding must also
+            // be collapsed before the rows are read.
+            let has_nested_typed_value = target
+                .typed_value_column()
+                .is_some_and(|typed_value| typed_value.data_type().is_nested());
+            let target = if requested_variant || has_nested_typed_value {
                 unshred_variant(&target)?
             } else {
                 target
@@ -249,20 +255,13 @@ fn shredded_get_path(
                 cast_options,
                 target.len(),
             )?;
+            // A row that cannot be read is invalid input, not a failed cast, so it is an error
+            // even when `cast_options.safe` is set.
             for i in 0..target.len() {
                 if target.is_null(i) {
                     builder.append_null()?;
-                } else if !cast_options.safe {
-                    let value = target.try_value(i)?;
-                    builder.append_value(value)?;
                 } else {
-                    let _ = match target.try_value(i) {
-                        Ok(v) => builder.append_value(v)?,
-                        Err(_) => {
-                            builder.append_null()?;
-                            false // add this to make match arms have the same return type
-                        }
-                    };
+                    builder.append_value(target.try_value(i)?)?;
                 }
             }
             builder.finish()
@@ -5699,5 +5698,32 @@ mod test {
             err.to_string().contains("at least one union field"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn test_variant_get_object_shredded_as_primitive() {
+        let json: ArrayRef = Arc::new(StringArray::from(vec![r#"{"a": 1}"#, "2"]));
+        let shred_type = DataType::Struct(vec![Field::new("a", DataType::Int64, true)].into());
+        let shredded: ArrayRef = shred_variant(&json_to_variant(&json).unwrap(), &shred_type)
+            .unwrap()
+            .into();
+        let as_type = Some(Arc::new(Field::new("v", DataType::Int64, true)));
+
+        // An object is not an Int64: NULL under safe casting, an error otherwise
+        let options = GetOptions::new().with_as_type(as_type.clone());
+        let result = variant_get(&shredded, options).unwrap();
+        assert_eq!(
+            result.as_primitive::<arrow::datatypes::Int64Type>(),
+            &Int64Array::from(vec![None, Some(2)])
+        );
+
+        let options = GetOptions::new()
+            .with_as_type(as_type)
+            .with_cast_options(CastOptions {
+                safe: false,
+                ..Default::default()
+            });
+        let err = variant_get(&shredded, options).unwrap_err();
+        assert!(matches!(err, ArrowError::CastError(_)), "{err}");
     }
 }

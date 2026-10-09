@@ -72,16 +72,29 @@ pub(crate) fn binary_array_value(array: &dyn Array, index: usize) -> Option<&[u8
     }
 }
 
-/// Returns a [`Variant`] from a `metadata` and `value` byte arrays, returns `None`
-/// if one of them is of invalid type.
+/// Returns a fully [validated] [`Variant`] from `metadata` and `value` byte arrays.
+///
+/// Errors if either array is not binary-like, or if the bytes are not a valid variant, including
+/// one nested more than [`MAX_NESTING_DEPTH`] deep.
+///
+/// [validated]: Variant#Validation
+/// [`MAX_NESTING_DEPTH`]: parquet_variant::MAX_NESTING_DEPTH
 pub(crate) fn variant_from_arrays_at<'m, 'v>(
     metadata: &'m dyn Array,
     value: &'v dyn Array,
     index: usize,
-) -> Option<Variant<'m, 'v>> {
-    let metadata = binary_array_value(metadata, index)?;
-    let value = binary_array_value(value, index)?;
-    Some(Variant::new(metadata, value))
+) -> Result<Variant<'m, 'v>> {
+    match (
+        binary_array_value(metadata, index),
+        binary_array_value(value, index),
+    ) {
+        (Some(metadata), Some(value)) => Variant::try_new(metadata, value),
+        _ => Err(ArrowError::InvalidArgumentError(format!(
+            "metadata and value fields must be binary-like arrays, instead got {} and {}",
+            metadata.data_type(),
+            value.data_type()
+        ))),
+    }
 }
 
 /// Returns an all-null binary `value` column of the given length.
@@ -465,11 +478,9 @@ impl VariantArray {
     /// - the index is out of bounds
     /// - the data in `typed_value` cannot be interpreted as a valid `Variant`
     /// - both `value` and `typed_value` are non-null for a non-struct `typed_value`
-    ///
-    /// # Panics
-    ///
-    /// Panics if the unshredded `metadata`/`value` bytes fail basic validation, since those are
-    /// read with [`Variant::new`]. This includes reading a row that is null.
+    /// - the `metadata`/`value` bytes read for the row are not a valid `Variant`, including a
+    ///   value nested more than [`MAX_NESTING_DEPTH`] deep. This includes reading a row that is
+    ///   null.
     ///
     /// If this is a shredded variant but has no value at the shredded location, it
     /// will return [`Variant::Null`].
@@ -480,8 +491,11 @@ impl VariantArray {
     /// This is certainly not the most efficient way to access values in a
     /// `VariantArray`, but it is useful for testing and debugging.
     ///
-    /// Note: Does not do deep validation of the [`Variant`], so it is up to the
-    /// caller to ensure that the metadata and value were constructed correctly.
+    /// Note: `metadata`/`value` bytes are fully [validated], which costs time linear in their
+    /// size but makes the returned [`Variant`] safe to traverse with infallible accessors.
+    ///
+    /// [`MAX_NESTING_DEPTH`]: parquet_variant::MAX_NESTING_DEPTH
+    /// [validated]: Variant#Validation
     pub fn try_value(&self, index: usize) -> Result<Variant<'_, '_>> {
         if self.len() <= index {
             return Err(ArrowError::InvalidArgumentError(format!(
@@ -494,7 +508,8 @@ impl VariantArray {
         match self.typed_value_column() {
             // Always prefer typed_value, if available
             Some(typed_value) if typed_value.is_valid(index) => {
-                if !matches!(typed_value.data_type(), DataType::Struct(_)) && value.is_valid(index) {
+                if !matches!(typed_value.data_type(), DataType::Struct(_)) && value.is_valid(index)
+                {
                     // Only a partially shredded struct is allowed to have values for both columns
                     return Err(ArrowError::InvalidArgumentError(
                         "Invalid variant, conflicting value and typed_value".to_owned(),
@@ -503,14 +518,7 @@ impl VariantArray {
                 typed_value_to_variant(typed_value, index)
             }
             // Otherwise fall back to value, if available
-            _ if value.is_valid(index) => variant_from_arrays_at(&self.metadata, value, index)
-                .ok_or_else(|| {
-                    ArrowError::InvalidArgumentError(format!(
-                        "metadata and value fields must be binary-like arrays, instead got {} and {}",
-                        self.metadata.data_type(),
-                        value.data_type()
-                    ))
-                }),
+            _ if value.is_valid(index) => variant_from_arrays_at(&self.metadata, value, index),
             // It is technically invalid for both value and typed_value to be null,
             // but the spec specifically requires readers to return Variant::Null in this case.
             _ => Ok(Variant::Null),
@@ -1980,5 +1988,98 @@ mod test {
             ),
             "unexpected error: {err}"
         );
+    }
+
+    /// Metadata and value bytes of a row that is not a valid variant: malformed metadata, a
+    /// malformed value, and a value nested far deeper than [`MAX_NESTING_DEPTH`].
+    ///
+    /// [`MAX_NESTING_DEPTH`]: parquet_variant::MAX_NESTING_DEPTH
+    fn invalid_rows() -> Vec<(&'static str, Vec<u8>, Vec<u8>)> {
+        let metadata = vec![0x01, 0x00, 0x00]; // empty dictionary
+        // One-element list whose element is an Int8 missing its payload byte, so it only fails
+        // full validation
+        let malformed_value = vec![0x0F, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0x0C];
+        // 20,000 single-element lists nested around a null
+        let mut deep = vec![0x00];
+        for _ in 0..20_000 {
+            let mut outer = vec![0x0F, 1];
+            outer.extend_from_slice(&0u32.to_le_bytes());
+            outer.extend_from_slice(&(deep.len() as u32).to_le_bytes());
+            outer.append(&mut deep);
+            deep = outer;
+        }
+        vec![
+            ("malformed metadata", vec![0x01, 0x05, 0x00], vec![0x00]),
+            ("malformed value", metadata.clone(), malformed_value),
+            ("too deep", metadata, deep),
+        ]
+    }
+
+    /// A valid row 0 followed by the invalid row 1, as a canonical (unshredded) array and as an
+    /// array shredded to `Int64` whose row 1 falls back to `value`.
+    fn arrays_with_invalid_row(metadata: &[u8], value: &[u8]) -> [VariantArray; 2] {
+        let metadata: ArrayRef = Arc::new(BinaryViewArray::from(vec![
+            &[0x01, 0x00, 0x00][..],
+            metadata,
+        ]));
+        let canonical = VariantArray::from_parts_unshredded(
+            metadata.clone(),
+            Arc::new(BinaryViewArray::from(vec![&[0x0C, 7][..], value])),
+            None,
+        );
+        let shredded = VariantArray::from_parts(
+            metadata,
+            Arc::new(BinaryViewArray::from(vec![None, Some(value)])),
+            Some(Arc::new(Int64Array::from(vec![Some(7), None]))),
+            None,
+        );
+        [canonical, shredded]
+    }
+
+    #[test]
+    fn try_value_errors_on_invalid_bytes() {
+        for (case, metadata, value) in invalid_rows() {
+            for array in arrays_with_invalid_row(&metadata, &value) {
+                assert!(array.try_value(0).is_ok(), "{case}");
+                assert!(array.try_value(1).is_err(), "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn unshred_variant_errors_on_invalid_bytes() {
+        for (case, metadata, value) in invalid_rows() {
+            for array in arrays_with_invalid_row(&metadata, &value) {
+                assert!(crate::unshred_variant(&array).is_err(), "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn variant_get_errors_on_invalid_bytes() {
+        let as_types = [
+            Field::new("v", DataType::Int64, true),
+            Field::new("v", DataType::Struct(Fields::empty()), true)
+                .with_extension_type(VariantType),
+        ];
+        for (case, metadata, value) in invalid_rows() {
+            for array in arrays_with_invalid_row(&metadata, &value) {
+                let array = ArrayRef::from(array);
+                for as_type in &as_types {
+                    // Invalid bytes are an error even under the default safe cast options
+                    let options = GetOptions::new().with_as_type(Some(Arc::new(as_type.clone())));
+                    assert!(variant_get(&array, options).is_err(), "{case}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn variant_to_json_errors_on_invalid_bytes() {
+        for (case, metadata, value) in invalid_rows() {
+            for array in arrays_with_invalid_row(&metadata, &value) {
+                assert!(variant_to_json(&ArrayRef::from(array)).is_err(), "{case}");
+            }
+        }
     }
 }

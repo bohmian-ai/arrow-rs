@@ -93,7 +93,7 @@ pub(crate) fn shred_variant_with_options(
         if array.is_null(i) {
             builder.append_null()?;
         } else {
-            builder.append_value(array.value(i))?;
+            builder.append_value(array.try_value(i)?)?;
         }
     }
     let (value, typed_value, nulls) = builder.finish()?;

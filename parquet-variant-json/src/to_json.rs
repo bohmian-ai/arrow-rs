@@ -40,7 +40,9 @@ pub trait VariantToJson {
     /// # Returns
     ///
     /// * `Ok(())` if successful
-    /// * `Err` with error details if conversion fails
+    /// * `Err` with error details if conversion fails, including when the variant is not
+    ///   [valid](Variant#Validation) or is nested more than
+    ///   [`MAX_NESTING_DEPTH`](parquet_variant::MAX_NESTING_DEPTH) deep
     ///
     /// # Examples
     ///
@@ -91,7 +93,9 @@ pub trait VariantToJson {
     /// # Returns
     ///
     /// * `Ok(String)` containing the JSON representation
-    /// * `Err` with error details if conversion fails
+    /// * `Err` with error details if conversion fails, including when the variant is not
+    ///   [valid](Variant#Validation) or is nested more than
+    ///   [`MAX_NESTING_DEPTH`](parquet_variant::MAX_NESTING_DEPTH) deep
     ///
     /// # Examples
     ///
@@ -148,7 +152,9 @@ pub trait VariantToJson {
     /// # Returns
     ///
     /// * `Ok(Value)` containing the JSON value
-    /// * `Err` with error details if conversion fails
+    /// * `Err` with error details if conversion fails, including when the variant is not
+    ///   [valid](Variant#Validation) or is nested more than
+    ///   [`MAX_NESTING_DEPTH`](parquet_variant::MAX_NESTING_DEPTH) deep
     ///
     /// # Examples
     ///
@@ -165,65 +171,12 @@ pub trait VariantToJson {
     fn to_json_value(&self) -> Result<Value, ArrowError>;
 }
 
+// The trait methods fully validate the variant once, which rejects invalid bytes and bounds the
+// nesting depth by `MAX_NESTING_DEPTH`. The recursive helpers below then traverse it with
+// infallible accessors that cannot panic or overflow the stack.
 impl VariantToJson for Variant<'_, '_> {
     fn to_json(&self, buffer: &mut impl Write) -> Result<(), ArrowError> {
-        match self {
-            Variant::Null => write!(buffer, "null")?,
-            Variant::BooleanTrue => write!(buffer, "true")?,
-            Variant::BooleanFalse => write!(buffer, "false")?,
-            Variant::Int8(i) => write!(buffer, "{i}")?,
-            Variant::Int16(i) => write!(buffer, "{i}")?,
-            Variant::Int32(i) => write!(buffer, "{i}")?,
-            Variant::Int64(i) => write!(buffer, "{i}")?,
-            Variant::Float(f) => write!(buffer, "{f}")?,
-            Variant::Double(f) => write!(buffer, "{f}")?,
-            Variant::Decimal4(decimal) => write!(buffer, "{decimal}")?,
-            Variant::Decimal8(decimal) => write!(buffer, "{decimal}")?,
-            Variant::Decimal16(decimal) => write!(buffer, "{decimal}")?,
-            Variant::Date(date) => write!(buffer, "\"{}\"", format_date_string(date))?,
-            Variant::TimestampMicros(ts) | Variant::TimestampNanos(ts) => {
-                write!(buffer, "\"{}\"", ts.to_rfc3339())?
-            }
-            Variant::TimestampNtzMicros(ts) => {
-                write!(buffer, "\"{}\"", format_timestamp_ntz_string(ts, 6))?
-            }
-            Variant::TimestampNtzNanos(ts) => {
-                write!(buffer, "\"{}\"", format_timestamp_ntz_string(ts, 9))?
-            }
-            Variant::Time(time) => write!(buffer, "\"{}\"", format_time_ntz_str(time))?,
-            Variant::Binary(bytes) => {
-                // Encode binary as base64 string
-                let base64_str = format_binary_base64(bytes);
-                let json_str = serde_json::to_string(&base64_str).map_err(|e| {
-                    ArrowError::InvalidArgumentError(format!("JSON encoding error: {e}"))
-                })?;
-                write!(buffer, "{json_str}")?
-            }
-            Variant::String(s) => {
-                // Use serde_json to properly escape the string
-                let json_str = serde_json::to_string(s).map_err(|e| {
-                    ArrowError::InvalidArgumentError(format!("JSON encoding error: {e}"))
-                })?;
-                write!(buffer, "{json_str}")?
-            }
-            Variant::ShortString(s) => {
-                // Use serde_json to properly escape the string
-                let json_str = serde_json::to_string(s.as_str()).map_err(|e| {
-                    ArrowError::InvalidArgumentError(format!("JSON encoding error: {e}"))
-                })?;
-                write!(buffer, "{json_str}")?
-            }
-            Variant::Uuid(uuid) => {
-                write!(buffer, "\"{uuid}\"")?;
-            }
-            Variant::Object(obj) => {
-                convert_object_to_json(buffer, obj)?;
-            }
-            Variant::List(arr) => {
-                convert_array_to_json(buffer, arr)?;
-            }
-        }
-        Ok(())
+        write_json(&self.clone().with_full_validation()?, buffer)
     }
 
     fn to_json_string(&self) -> Result<String, ArrowError> {
@@ -234,103 +187,165 @@ impl VariantToJson for Variant<'_, '_> {
     }
 
     fn to_json_value(&self) -> Result<Value, ArrowError> {
-        match self {
-            Variant::Null => Ok(Value::Null),
-            Variant::BooleanTrue => Ok(Value::Bool(true)),
-            Variant::BooleanFalse => Ok(Value::Bool(false)),
-            Variant::Int8(i) => Ok(Value::Number((*i).into())),
-            Variant::Int16(i) => Ok(Value::Number((*i).into())),
-            Variant::Int32(i) => Ok(Value::Number((*i).into())),
-            Variant::Int64(i) => Ok(Value::Number((*i).into())),
-            Variant::Float(f) => serde_json::Number::from_f64((*f).into())
-                .map(Value::Number)
-                .ok_or_else(|| ArrowError::InvalidArgumentError("Invalid float value".to_string())),
-            Variant::Double(f) => serde_json::Number::from_f64(*f)
-                .map(Value::Number)
-                .ok_or_else(|| {
-                    ArrowError::InvalidArgumentError("Invalid double value".to_string())
-                }),
-            Variant::Decimal4(decimal4) => {
-                let scale = decimal4.scale();
-                let integer = decimal4.integer();
+        json_value(&self.clone().with_full_validation()?)
+    }
+}
 
-                let integer = if scale == 0 {
-                    integer
-                } else {
-                    let divisor = 10_i32.pow(scale as u32);
-                    if integer % divisor != 0 {
-                        // fall back to floating point
-                        return Ok(Value::from(integer as f64 / divisor as f64));
-                    }
-                    integer / divisor
-                };
-                Ok(Value::from(integer))
-            }
-            Variant::Decimal8(decimal8) => {
-                let scale = decimal8.scale();
-                let integer = decimal8.integer();
+/// Writes a fully validated variant as JSON
+fn write_json(variant: &Variant, buffer: &mut impl Write) -> Result<(), ArrowError> {
+    match variant {
+        Variant::Null => write!(buffer, "null")?,
+        Variant::BooleanTrue => write!(buffer, "true")?,
+        Variant::BooleanFalse => write!(buffer, "false")?,
+        Variant::Int8(i) => write!(buffer, "{i}")?,
+        Variant::Int16(i) => write!(buffer, "{i}")?,
+        Variant::Int32(i) => write!(buffer, "{i}")?,
+        Variant::Int64(i) => write!(buffer, "{i}")?,
+        Variant::Float(f) => write!(buffer, "{f}")?,
+        Variant::Double(f) => write!(buffer, "{f}")?,
+        Variant::Decimal4(decimal) => write!(buffer, "{decimal}")?,
+        Variant::Decimal8(decimal) => write!(buffer, "{decimal}")?,
+        Variant::Decimal16(decimal) => write!(buffer, "{decimal}")?,
+        Variant::Date(date) => write!(buffer, "\"{}\"", format_date_string(date))?,
+        Variant::TimestampMicros(ts) | Variant::TimestampNanos(ts) => {
+            write!(buffer, "\"{}\"", ts.to_rfc3339())?
+        }
+        Variant::TimestampNtzMicros(ts) => {
+            write!(buffer, "\"{}\"", format_timestamp_ntz_string(ts, 6))?
+        }
+        Variant::TimestampNtzNanos(ts) => {
+            write!(buffer, "\"{}\"", format_timestamp_ntz_string(ts, 9))?
+        }
+        Variant::Time(time) => write!(buffer, "\"{}\"", format_time_ntz_str(time))?,
+        Variant::Binary(bytes) => {
+            // Encode binary as base64 string
+            let base64_str = format_binary_base64(bytes);
+            let json_str = serde_json::to_string(&base64_str).map_err(|e| {
+                ArrowError::InvalidArgumentError(format!("JSON encoding error: {e}"))
+            })?;
+            write!(buffer, "{json_str}")?
+        }
+        Variant::String(s) => {
+            // Use serde_json to properly escape the string
+            let json_str = serde_json::to_string(s).map_err(|e| {
+                ArrowError::InvalidArgumentError(format!("JSON encoding error: {e}"))
+            })?;
+            write!(buffer, "{json_str}")?
+        }
+        Variant::ShortString(s) => {
+            // Use serde_json to properly escape the string
+            let json_str = serde_json::to_string(s.as_str()).map_err(|e| {
+                ArrowError::InvalidArgumentError(format!("JSON encoding error: {e}"))
+            })?;
+            write!(buffer, "{json_str}")?
+        }
+        Variant::Uuid(uuid) => {
+            write!(buffer, "\"{uuid}\"")?;
+        }
+        Variant::Object(obj) => {
+            convert_object_to_json(buffer, obj)?;
+        }
+        Variant::List(arr) => {
+            convert_array_to_json(buffer, arr)?;
+        }
+    }
+    Ok(())
+}
 
-                let integer = if scale == 0 {
-                    integer
-                } else {
-                    let divisor = 10_i64.pow(scale as u32);
-                    if integer % divisor != 0 {
-                        // fall back to floating point
-                        return Ok(Value::from(integer as f64 / divisor as f64));
-                    }
-                    integer / divisor
-                };
-                Ok(Value::from(integer))
-            }
-            Variant::Decimal16(decimal16) => {
-                let scale = decimal16.scale();
-                let integer = decimal16.integer();
+/// Converts a fully validated variant to a JSON value
+fn json_value(variant: &Variant) -> Result<Value, ArrowError> {
+    match variant {
+        Variant::Null => Ok(Value::Null),
+        Variant::BooleanTrue => Ok(Value::Bool(true)),
+        Variant::BooleanFalse => Ok(Value::Bool(false)),
+        Variant::Int8(i) => Ok(Value::Number((*i).into())),
+        Variant::Int16(i) => Ok(Value::Number((*i).into())),
+        Variant::Int32(i) => Ok(Value::Number((*i).into())),
+        Variant::Int64(i) => Ok(Value::Number((*i).into())),
+        Variant::Float(f) => serde_json::Number::from_f64((*f).into())
+            .map(Value::Number)
+            .ok_or_else(|| ArrowError::InvalidArgumentError("Invalid float value".to_string())),
+        Variant::Double(f) => serde_json::Number::from_f64(*f)
+            .map(Value::Number)
+            .ok_or_else(|| ArrowError::InvalidArgumentError("Invalid double value".to_string())),
+        Variant::Decimal4(decimal4) => {
+            let scale = decimal4.scale();
+            let integer = decimal4.integer();
 
-                let integer = if scale == 0 {
-                    integer
-                } else {
-                    let divisor = 10_i128.pow(scale as u32);
-                    if integer % divisor != 0 {
-                        // fall back to floating point
-                        return Ok(Value::from(integer as f64 / divisor as f64));
-                    }
-                    integer / divisor
-                };
-                // i128 has higher precision than any 64-bit type. Try a lossless narrowing cast to
-                // i64 or u64 first, falling back to a lossy narrowing cast to f64 if necessary.
-                let value = i64::try_from(integer)
-                    .map(Value::from)
-                    .or_else(|_| u64::try_from(integer).map(Value::from))
-                    .unwrap_or_else(|_| Value::from(integer as f64));
-                Ok(value)
-            }
-            Variant::Date(date) => Ok(Value::String(format_date_string(date))),
-            Variant::TimestampMicros(ts) | Variant::TimestampNanos(ts) => {
-                Ok(Value::String(ts.to_rfc3339()))
-            }
-            Variant::TimestampNtzMicros(ts) => {
-                Ok(Value::String(format_timestamp_ntz_string(ts, 6)))
-            }
-            Variant::TimestampNtzNanos(ts) => Ok(Value::String(format_timestamp_ntz_string(ts, 9))),
-            Variant::Time(time) => Ok(Value::String(format_time_ntz_str(time))),
-            Variant::Binary(bytes) => Ok(Value::String(format_binary_base64(bytes))),
-            Variant::String(s) => Ok(Value::String(s.to_string())),
-            Variant::ShortString(s) => Ok(Value::String(s.to_string())),
-            Variant::Uuid(uuid) => Ok(Value::String(uuid.to_string())),
-            Variant::Object(obj) => {
-                let map = obj
-                    .iter()
-                    .map(|(k, v)| v.to_json_value().map(|json_val| (k.to_string(), json_val)))
-                    .collect::<Result<_, _>>()?;
-                Ok(Value::Object(map))
-            }
-            Variant::List(arr) => {
-                let vec = arr
-                    .iter()
-                    .map(|element| element.to_json_value())
-                    .collect::<Result<_, _>>()?;
-                Ok(Value::Array(vec))
-            }
+            let integer = if scale == 0 {
+                integer
+            } else {
+                let divisor = 10_i32.pow(scale as u32);
+                if integer % divisor != 0 {
+                    // fall back to floating point
+                    return Ok(Value::from(integer as f64 / divisor as f64));
+                }
+                integer / divisor
+            };
+            Ok(Value::from(integer))
+        }
+        Variant::Decimal8(decimal8) => {
+            let scale = decimal8.scale();
+            let integer = decimal8.integer();
+
+            let integer = if scale == 0 {
+                integer
+            } else {
+                let divisor = 10_i64.pow(scale as u32);
+                if integer % divisor != 0 {
+                    // fall back to floating point
+                    return Ok(Value::from(integer as f64 / divisor as f64));
+                }
+                integer / divisor
+            };
+            Ok(Value::from(integer))
+        }
+        Variant::Decimal16(decimal16) => {
+            let scale = decimal16.scale();
+            let integer = decimal16.integer();
+
+            let integer = if scale == 0 {
+                integer
+            } else {
+                let divisor = 10_i128.pow(scale as u32);
+                if integer % divisor != 0 {
+                    // fall back to floating point
+                    return Ok(Value::from(integer as f64 / divisor as f64));
+                }
+                integer / divisor
+            };
+            // i128 has higher precision than any 64-bit type. Try a lossless narrowing cast to
+            // i64 or u64 first, falling back to a lossy narrowing cast to f64 if necessary.
+            let value = i64::try_from(integer)
+                .map(Value::from)
+                .or_else(|_| u64::try_from(integer).map(Value::from))
+                .unwrap_or_else(|_| Value::from(integer as f64));
+            Ok(value)
+        }
+        Variant::Date(date) => Ok(Value::String(format_date_string(date))),
+        Variant::TimestampMicros(ts) | Variant::TimestampNanos(ts) => {
+            Ok(Value::String(ts.to_rfc3339()))
+        }
+        Variant::TimestampNtzMicros(ts) => Ok(Value::String(format_timestamp_ntz_string(ts, 6))),
+        Variant::TimestampNtzNanos(ts) => Ok(Value::String(format_timestamp_ntz_string(ts, 9))),
+        Variant::Time(time) => Ok(Value::String(format_time_ntz_str(time))),
+        Variant::Binary(bytes) => Ok(Value::String(format_binary_base64(bytes))),
+        Variant::String(s) => Ok(Value::String(s.to_string())),
+        Variant::ShortString(s) => Ok(Value::String(s.to_string())),
+        Variant::Uuid(uuid) => Ok(Value::String(uuid.to_string())),
+        Variant::Object(obj) => {
+            let map = obj
+                .iter()
+                .map(|(k, v)| json_value(&v).map(|json_val| (k.to_string(), json_val)))
+                .collect::<Result<_, _>>()?;
+            Ok(Value::Object(map))
+        }
+        Variant::List(arr) => {
+            let vec = arr
+                .iter()
+                .map(|element| json_value(&element))
+                .collect::<Result<_, _>>()?;
+            Ok(Value::Array(vec))
         }
     }
 }
@@ -385,7 +400,7 @@ fn convert_object_to_json(buffer: &mut impl Write, obj: &VariantObject) -> Resul
         write!(buffer, "{json_key}:")?;
 
         // Recursively convert the value
-        value.to_json(buffer)?;
+        write_json(&value, buffer)?;
     }
 
     write!(buffer, "}}")?;
@@ -403,7 +418,7 @@ fn convert_array_to_json(buffer: &mut impl Write, arr: &VariantList) -> Result<(
         }
         first = false;
 
-        element.to_json(buffer)?;
+        write_json(&element, buffer)?;
     }
 
     write!(buffer, "]")?;
@@ -1349,5 +1364,32 @@ mod tests {
         assert!(matches!(normal_double_result, Value::Number(_)));
 
         Ok(())
+    }
+
+    #[test]
+    fn test_unvalidated_invalid_variant_is_an_error() {
+        let metadata = [0x01, 0x00, 0x00]; // empty dictionary
+        // One-element list whose element is an Int8 missing its payload byte
+        let malformed = [0x0F, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0x0C];
+        // 20,000 single-element lists nested around a null
+        let mut deep = vec![0x00];
+        for _ in 0..20_000 {
+            let mut outer = vec![0x0F, 1];
+            outer.extend_from_slice(&0u32.to_le_bytes());
+            outer.extend_from_slice(&(deep.len() as u32).to_le_bytes());
+            outer.append(&mut deep);
+            deep = outer;
+        }
+        for value in [&malformed[..], &deep] {
+            // `Variant::new` validates only the outermost header
+            let variant = Variant::new(&metadata, value);
+            assert!(variant.to_json_string().is_err());
+            assert!(variant.to_json_value().is_err());
+        }
+        let err = Variant::new(&metadata, &deep).to_json_string().unwrap_err();
+        assert!(
+            err.to_string().contains("nesting depth exceeds"),
+            "unexpected error: {err}"
+        );
     }
 }
