@@ -90,6 +90,9 @@ fn variant_from_number<'m, 'v>(n: &Number) -> Result<Variant<'m, 'v>, ArrowError
         } else {
             Ok(i.into())
         }
+    } else if let Some(u) = n.as_u64() {
+        // Above i64::MAX: an exact scale-0 Decimal16, as for every other u64
+        Ok(u.into())
     } else {
         // Todo: Try decimal once we implement custom JSON parsing where we have access to strings
         // Try double - currently json_to_variant does not produce decimal
@@ -336,7 +339,6 @@ mod test {
         .run()
     }
 
-    #[ignore]
     #[test]
     fn test_json_to_variant_decimal16_large_integer() -> Result<(), ArrowError> {
         JsonToVariantTest {
@@ -344,6 +346,21 @@ mod test {
             expected: Variant::from(VariantDecimal16::try_new(9999999999999999999, 0)?),
         }
         .run()
+    }
+
+    #[test]
+    fn test_json_to_variant_u64_max_round_trips() -> Result<(), ArrowError> {
+        let json = u64::MAX.to_string();
+        JsonToVariantTest {
+            json: &json,
+            expected: Variant::from(VariantDecimal16::try_new(u64::MAX.into(), 0)?),
+        }
+        .run()?;
+        let mut builder = VariantBuilder::new();
+        builder.append_json(&json)?;
+        let (metadata, value) = builder.finish();
+        assert_eq!(Variant::try_new(&metadata, &value)?.to_json_string()?, json);
+        Ok(())
     }
 
     #[ignore]
