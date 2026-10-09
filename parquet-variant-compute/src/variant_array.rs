@@ -1412,7 +1412,7 @@ mod test {
     };
     use arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use arrow_schema::{Field, Fields};
-    use parquet_variant::{EMPTY_VARIANT_METADATA_BYTES, ShortString};
+    use parquet_variant::{EMPTY_VARIANT_METADATA_BYTES, MAX_NESTING_DEPTH, ShortString};
 
     #[test]
     fn invalid_not_a_struct_array() {
@@ -1999,19 +1999,10 @@ mod test {
         // One-element list whose element is an Int8 missing its payload byte, so it only fails
         // full validation
         let malformed_value = vec![0x0F, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0x0C];
-        // 20,000 single-element lists nested around a null
-        let mut deep = vec![0x00];
-        for _ in 0..20_000 {
-            let mut outer = vec![0x0F, 1];
-            outer.extend_from_slice(&0u32.to_le_bytes());
-            outer.extend_from_slice(&(deep.len() as u32).to_le_bytes());
-            outer.append(&mut deep);
-            deep = outer;
-        }
         vec![
             ("malformed metadata", vec![0x01, 0x05, 0x00], vec![0x00]),
             ("malformed value", metadata.clone(), malformed_value),
-            ("too deep", metadata, deep),
+            ("too deep", metadata, nested(20_000, false)),
         ]
     }
 
@@ -2081,5 +2072,68 @@ mod test {
                 assert!(variant_to_json(&ArrayRef::from(array)).is_err(), "{case}");
             }
         }
+    }
+
+    /// A single-row unshredded array holding `metadata` and `value`.
+    fn unshredded(metadata: &[u8], value: &[u8]) -> ArrayRef {
+        VariantArray::from_parts_unshredded(
+            Arc::new(BinaryArray::from(vec![metadata])),
+            Arc::new(BinaryArray::from(vec![value])),
+            None,
+        )
+        .into()
+    }
+
+    /// `depth` single-element containers nested around a null, each a list, or an object
+    /// whose only field has field id 0.
+    fn nested(depth: usize, object: bool) -> Vec<u8> {
+        let mut value = vec![0x00];
+        for _ in 0..depth {
+            // header: 4-byte offsets, then one element (and its 1-byte field id)
+            let mut outer = if object {
+                vec![0b0000_1110, 1, 0]
+            } else {
+                vec![0x0F, 1]
+            };
+            outer.extend_from_slice(&0u32.to_le_bytes());
+            outer.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            outer.append(&mut value);
+            value = outer;
+        }
+        value
+    }
+
+    #[test]
+    fn try_value_to_json_value_errors_on_invalid_bytes() {
+        use parquet_variant_json::VariantToJson;
+
+        let empty_dictionary = [0x01, 0x00, 0x00];
+        let one_key_dictionary = [0x01, 0x01, 0x00, 0x01, b'a'];
+        let cases = [
+            (&[0xFF][..], vec![0xFF]),
+            (&empty_dictionary[..], nested(20_000, false)),
+            (&empty_dictionary[..], nested(20_000, true)),
+            (&one_key_dictionary[..], nested(20_000, true)),
+        ];
+        for (metadata, value) in cases {
+            let array = unshredded(metadata, &value);
+            let result =
+                VariantArray::try_new(&array).and_then(|array| array.try_value(0)?.to_json_value());
+            assert!(result.is_err(), "{metadata:?}");
+        }
+
+        // Within the limit, the same nesting reads and renders
+        let array = unshredded(&one_key_dictionary, &nested(MAX_NESTING_DEPTH, true));
+        let array = VariantArray::try_new(&array).unwrap();
+        array.try_value(0).unwrap().to_json_value().unwrap();
+        let array = unshredded(&one_key_dictionary, &nested(MAX_NESTING_DEPTH + 1, true));
+        let err = VariantArray::try_new(&array)
+            .unwrap()
+            .try_value(0)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("nesting depth exceeds"),
+            "unexpected error: {err}"
+        );
     }
 }
