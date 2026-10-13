@@ -727,6 +727,51 @@ dependencies = [
 ]
 
 [[package]]
+name = "bohmian-parquet-variant"
+version = "60.0.0"
+dependencies = [
+ "arrow-schema",
+ "chrono",
+ "criterion",
+ "half",
+ "indexmap",
+ "proptest",
+ "rand 0.10.2",
+ "simdutf8",
+ "uuid",
+]
+
+[[package]]
+name = "bohmian-parquet-variant-compute"
+version = "60.0.0"
+dependencies = [
+ "arrow",
+ "arrow-schema",
+ "bohmian-parquet-variant",
+ "bohmian-parquet-variant-json",
+ "chrono",
+ "criterion",
+ "half",
+ "indexmap",
+ "num-traits",
+ "rand 0.10.2",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "bohmian-parquet-variant-json"
+version = "60.0.0"
+dependencies = [
+ "arrow-schema",
+ "base64 0.23.1",
+ "bohmian-parquet-variant",
+ "chrono",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "bon"
 version = "3.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2419,6 +2464,8 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "base64 0.23.1",
+ "bohmian-parquet-variant",
+ "bohmian-parquet-variant-compute",
  "brotli",
  "bytes",
  "chrono",
@@ -2436,8 +2483,6 @@ dependencies = [
  "num-traits",
  "object_store",
  "parquet-geospatial",
- "parquet-variant",
- "parquet-variant-compute",
  "rand 0.10.2",
  "ring",
  "seq-macro",
@@ -2462,51 +2507,6 @@ dependencies = [
  "serde_json",
  "wkb",
  "wkt",
-]
-
-[[package]]
-name = "parquet-variant"
-version = "60.0.0"
-dependencies = [
- "arrow-schema",
- "chrono",
- "criterion",
- "half",
- "indexmap",
- "proptest",
- "rand 0.10.2",
- "simdutf8",
- "uuid",
-]
-
-[[package]]
-name = "parquet-variant-compute"
-version = "60.0.0"
-dependencies = [
- "arrow",
- "arrow-schema",
- "chrono",
- "criterion",
- "half",
- "indexmap",
- "num-traits",
- "parquet-variant",
- "parquet-variant-json",
- "rand 0.10.2",
- "serde_json",
- "uuid",
-]
-
-[[package]]
-name = "parquet-variant-json"
-version = "60.0.0"
-dependencies = [
- "arrow-schema",
- "base64 0.23.1",
- "chrono",
- "parquet-variant",
- "serde_json",
- "uuid",
 ]
 
 [[package]]
