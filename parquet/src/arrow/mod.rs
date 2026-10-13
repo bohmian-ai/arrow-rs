@@ -222,6 +222,7 @@ pub use self::schema::{
     parquet_to_arrow_field_levels, parquet_to_arrow_field_levels_with_virtual,
     parquet_to_arrow_schema, parquet_to_arrow_schema_by_columns, virtual_type::*,
 };
+pub(crate) use self::schema::{ParquetField, parquet_to_arrow_schema_and_fields};
 
 /// Schema metadata key used to store serialized Arrow schema
 ///

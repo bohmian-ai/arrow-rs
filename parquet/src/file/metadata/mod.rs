@@ -127,7 +127,18 @@ pub struct ParquetMetaData {
     /// Optional file decryptor
     #[cfg(feature = "encryption")]
     file_decryptor: Option<Box<FileDecryptor>>,
+    /// The Arrow schema and field levels [`Self::file_metadata`] derives,
+    /// memoized on first use by [`Self::arrow_schema`]
+    #[cfg(feature = "arrow")]
+    arrow_schema: std::sync::OnceLock<DerivedArrowSchema>,
 }
+
+/// The Arrow schema of a file and the field levels its columns decode with.
+#[cfg(feature = "arrow")]
+type DerivedArrowSchema = (
+    arrow_schema::SchemaRef,
+    Option<Arc<crate::arrow::ParquetField>>,
+);
 
 impl ParquetMetaData {
     /// Creates Parquet metadata from file metadata and a list of row
@@ -139,7 +150,53 @@ impl ParquetMetaData {
             page_index: None,
             #[cfg(feature = "encryption")]
             file_decryptor: None,
+            #[cfg(feature = "arrow")]
+            arrow_schema: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Returns the Arrow schema this file's metadata derives: its Parquet
+    /// schema, with the embedded `ARROW:schema` as a hint, and its key-value
+    /// metadata.
+    ///
+    /// This is [`parquet_to_arrow_schema`] of [`Self::file_metadata`],
+    /// derived once and shared by every later call, so a reader reopening a
+    /// cached footer does not decode it again. The file metadata never
+    /// changes after construction, so the memo cannot go stale. Its memory is
+    /// not counted by [`Self::memory_size`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the conversion error of a schema Arrow cannot represent; a
+    /// failed derivation is not memoized.
+    ///
+    /// [`parquet_to_arrow_schema`]: crate::arrow::parquet_to_arrow_schema
+    #[cfg(feature = "arrow")]
+    pub fn arrow_schema(&self) -> Result<arrow_schema::SchemaRef> {
+        Ok(self.arrow_schema_and_fields()?.0)
+    }
+
+    /// Returns [`Self::arrow_schema`] together with the field levels its
+    /// columns decode with, deriving both on the first call.
+    ///
+    /// # Errors
+    ///
+    /// Returns the conversion error of a schema Arrow cannot represent.
+    #[cfg(feature = "arrow")]
+    pub(crate) fn arrow_schema_and_fields(&self) -> Result<DerivedArrowSchema> {
+        if let Some((schema, fields)) = self.arrow_schema.get() {
+            return Ok((Arc::clone(schema), fields.clone()));
+        }
+        let (schema, fields) = crate::arrow::parquet_to_arrow_schema_and_fields(
+            self.file_metadata.schema_descr(),
+            crate::arrow::ProjectionMask::all(),
+            self.file_metadata.key_value_metadata(),
+            &[],
+        )?;
+        let (schema, fields) = self
+            .arrow_schema
+            .get_or_init(|| (Arc::new(schema), fields.map(Arc::new)));
+        Ok((Arc::clone(schema), fields.clone()))
     }
 
     /// Adds [`FileDecryptor`] to this metadata instance to enable decryption of
@@ -2080,11 +2137,16 @@ mod tests {
             .set_row_groups(row_group_meta_with_stats)
             .build();
 
+        // The empty slot of the memoized Arrow schema
+        #[cfg(feature = "arrow")]
+        let memo = std::mem::size_of::<std::sync::OnceLock<DerivedArrowSchema>>();
+        #[cfg(not(feature = "arrow"))]
+        let memo = 0;
         // Base size without page index
         #[cfg(not(feature = "encryption"))]
-        let base_expected_size = 2766;
+        let base_expected_size = 2766 + memo;
         #[cfg(feature = "encryption")]
-        let base_expected_size = 2934;
+        let base_expected_size = 2934 + memo;
 
         assert_eq!(parquet_meta.memory_size(), base_expected_size);
 
@@ -2119,9 +2181,9 @@ mod tests {
 
         // Size with page index (includes Arc overhead plus PageIndex heap size)
         #[cfg(not(feature = "encryption"))]
-        let bigger_expected_size = 3280;
+        let bigger_expected_size = 3280 + memo;
         #[cfg(feature = "encryption")]
-        let bigger_expected_size = 3448;
+        let bigger_expected_size = 3448 + memo;
 
         // more set fields means more memory usage
         assert!(bigger_expected_size > base_expected_size);
@@ -2168,7 +2230,12 @@ mod tests {
             .set_row_groups(row_group_meta.clone())
             .build();
 
-        let base_expected_size = 2042;
+        // The empty slot of the memoized Arrow schema
+        #[cfg(feature = "arrow")]
+        let memo = std::mem::size_of::<std::sync::OnceLock<DerivedArrowSchema>>();
+        #[cfg(not(feature = "arrow"))]
+        let memo = 0;
+        let base_expected_size = 2042 + memo;
         assert_eq!(parquet_meta_data.memory_size(), base_expected_size);
 
         let footer_key = b"0123456789012345";
@@ -2194,7 +2261,7 @@ mod tests {
             .set_file_decryptor(Some(decryptor))
             .build();
 
-        let expected_size_with_decryptor = 3056;
+        let expected_size_with_decryptor = 3056 + memo;
         assert!(expected_size_with_decryptor > base_expected_size);
 
         assert_eq!(

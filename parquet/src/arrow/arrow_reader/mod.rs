@@ -1035,6 +1035,10 @@ impl ArrowReaderMetadata {
     ///
     /// This function will not attempt to load the PageIndex if not present in the metadata, regardless
     /// of the settings in `options`. See [`Self::load`] to load metadata including the page index if needed.
+    ///
+    /// Without a supplied schema, virtual columns or `skip_arrow_metadata`,
+    /// the Arrow schema is [`ParquetMetaData::arrow_schema`], derived once per
+    /// `metadata` and shared by every reader opened from it.
     pub fn try_new(metadata: Arc<ParquetMetaData>, options: ArrowReaderOptions) -> Result<Self> {
         match options.supplied_schema {
             Some(supplied_schema) => Self::with_supplied_schema(
@@ -1042,6 +1046,14 @@ impl ArrowReaderMetadata {
                 supplied_schema.clone(),
                 &options.virtual_columns,
             ),
+            None if !options.skip_arrow_metadata && options.virtual_columns.is_empty() => {
+                let (schema, fields) = metadata.arrow_schema_and_fields()?;
+                Ok(Self {
+                    metadata,
+                    schema,
+                    fields,
+                })
+            }
             None => {
                 let kv_metadata = match options.skip_arrow_metadata {
                     true => None,
@@ -5756,6 +5768,52 @@ pub(crate) mod tests {
             "unexpected error: {err}"
         );
 
+        Ok(())
+    }
+
+    /// Reopening one `ParquetMetaData` reuses the Arrow schema its first open
+    /// derived, equal to a fresh derivation and honoring the `ARROW:schema`
+    /// hint; skipping that hint still derives its own schema.
+    #[test]
+    fn reader_metadata_reuses_the_memoized_arrow_schema() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            ArrowDataType::LargeUtf8,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(LargeStringArray::from(vec!["a", "b"]))],
+        )?;
+        let mut buffer = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buffer, schema, None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+        let metadata = Arc::new(
+            crate::file::metadata::ParquetMetaDataReader::new()
+                .parse_and_finish(&Bytes::from(buffer))?,
+        );
+
+        let first = ArrowReaderMetadata::try_new(Arc::clone(&metadata), ArrowReaderOptions::new())?;
+        let second =
+            ArrowReaderMetadata::try_new(Arc::clone(&metadata), ArrowReaderOptions::new())?;
+        assert!(Arc::ptr_eq(first.schema(), second.schema()));
+        assert!(Arc::ptr_eq(first.schema(), &metadata.arrow_schema()?));
+        let fresh = crate::arrow::parquet_to_arrow_schema(
+            metadata.file_metadata().schema_descr(),
+            metadata.file_metadata().key_value_metadata(),
+        )?;
+        assert_eq!(first.schema().as_ref(), &fresh);
+        assert_eq!(
+            first.schema().field(0).data_type(),
+            &ArrowDataType::LargeUtf8
+        );
+
+        let skipped = ArrowReaderMetadata::try_new(
+            Arc::clone(&metadata),
+            ArrowReaderOptions::new().with_skip_arrow_metadata(true),
+        )?;
+        assert_eq!(skipped.schema().field(0).data_type(), &ArrowDataType::Utf8);
         Ok(())
     }
 
