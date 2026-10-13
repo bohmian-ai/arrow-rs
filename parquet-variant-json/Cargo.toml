@@ -16,12 +16,12 @@
 # under the License.
 
 [package]
-name = "parquet-variant-json"
+name = "bohmian-parquet-variant-json"
 version = { workspace = true }
 license = { workspace = true }
-description = "Apache Parquet Variant to/from JSON"
+description = "Apache Parquet Variant to/from JSON (Bohmian fork of parquet-variant-json)"
 homepage = { workspace = true }
-repository = { workspace = true }
+repository = "https://github.com/bohmian-ai/arrow-rs"
 authors = { workspace = true }
 keywords = ["arrow", "parquet", "variant"]
 readme = "../parquet-variant/README.md"

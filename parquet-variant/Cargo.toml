@@ -16,12 +16,12 @@
 # under the License.
 
 [package]
-name = "parquet-variant"
+name = "bohmian-parquet-variant"
 version = { workspace = true }
 license = { workspace = true }
-description = "Apache Parquet Variant implementation in Rust"
+description = "Apache Parquet Variant implementation in Rust (Bohmian fork of parquet-variant)"
 homepage = { workspace = true }
-repository = { workspace = true }
+repository = "https://github.com/bohmian-ai/arrow-rs"
 authors = { workspace = true }
 keywords = ["arrow", "parquet", "variant"]
 readme = "README.md"

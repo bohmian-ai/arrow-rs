@@ -16,12 +16,12 @@
 # under the License.
 
 [package]
-name = "parquet-variant-compute"
+name = "bohmian-parquet-variant-compute"
 version = { workspace = true }
 license = { workspace = true }
-description = "Apache Parquet Variant Batch Processing"
+description = "Apache Parquet Variant Batch Processing (Bohmian fork of parquet-variant-compute)"
 homepage = { workspace = true }
-repository = { workspace = true }
+repository = "https://github.com/bohmian-ai/arrow-rs"
 authors = { workspace = true }
 keywords = ["arrow", "parquet", "variant"]
 edition = { workspace = true }
