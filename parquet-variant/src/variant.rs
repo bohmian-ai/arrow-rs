@@ -314,6 +314,25 @@ impl<'m, 'v> Variant<'m, 'v> {
         Self::try_new_with_metadata(metadata, value)
     }
 
+    /// Fallible [`Self::new`]: interprets a metadata and value buffer pair as a new
+    /// `Variant` with only basic (constant-cost) validation.
+    ///
+    /// The instance is [unvalidated]: traverse it only with fallible accessors such as
+    /// [`Self::try_get_path`], or validate it with [`Self::with_full_validation`] first.
+    ///
+    /// [unvalidated]: Self#Validation
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `metadata` or `value` fail basic validation.
+    pub fn try_new_with_shallow_validation(
+        metadata: &'m [u8],
+        value: &'v [u8],
+    ) -> Result<Self, ArrowError> {
+        let metadata = VariantMetadata::try_new_with_shallow_validation(metadata)?;
+        Self::try_new_with_metadata_and_shallow_validation(metadata, value)
+    }
+
     /// Attempts to interpret a metadata and value buffer pair as a new `Variant`.
     ///
     /// The instance is [unvalidated].
@@ -1570,6 +1589,43 @@ impl<'m, 'v> Variant<'m, 'v> {
                 VariantPathElement::Index { index } => output.get_list_element(*index),
             })
     }
+
+    /// Fallible [`Self::get_path`] that validates only what the path reads.
+    ///
+    /// Each step checks the header, offsets and field names it reads at constant cost, and
+    /// the value the path reaches is then [validated] in full, so corrupted bytes anywhere on
+    /// the path or inside the result return an error instead of panicking. Values off the
+    /// path are never decoded, so a lookup on a wide object costs the depth of the path, not
+    /// the size of the object. `self` may be [unvalidated]. Returns `Ok(None)` when the path
+    /// does not exist.
+    ///
+    /// [validated]: Self#Validation
+    /// [unvalidated]: Self#Validation
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any byte the path reads, or the value it reaches, is invalid.
+    pub fn try_get_path(&self, path: &VariantPath) -> Result<Option<Variant<'m, 'v>>, ArrowError> {
+        let mut current = self.clone();
+        for element in path.iter() {
+            let next = match (&current, element) {
+                (Variant::Object(object), VariantPathElement::Field { name }) => {
+                    object.try_get_with_shallow_validation(name)?
+                }
+                (Variant::List(list), VariantPathElement::Index { index })
+                    if *index < list.len() =>
+                {
+                    Some(list.try_get_with_shallow_validation(*index)?)
+                }
+                _ => None,
+            };
+            match next {
+                Some(value) => current = value,
+                None => return Ok(None),
+            }
+        }
+        current.with_full_validation().map(Some)
+    }
 }
 
 impl From<()> for Variant<'_, '_> {
@@ -1864,6 +1920,40 @@ mod tests {
         assert!(matches!(
             err,
             ArrowError::InvalidArgumentError(ref msg) if msg == "Received empty bytes"));
+    }
+
+    #[test]
+    fn test_try_get_path_validates_only_the_path() {
+        use crate::{VariantBuilder, VariantPath};
+
+        let mut builder = VariantBuilder::new();
+        let mut object = builder.new_object();
+        object.insert("a", 7i8);
+        object.insert("b", "zzzz");
+        object.finish();
+        let (metadata, mut value) = builder.finish();
+        let at = value.windows(4).position(|w| w == b"zzzz").unwrap();
+        value[at] = 0xFF;
+        assert!(Variant::try_new(&metadata, &value).is_err());
+
+        let variant = Variant::try_new_with_shallow_validation(&metadata, &value).unwrap();
+        assert_eq!(
+            variant
+                .try_get_path(&VariantPath::try_from("a").unwrap())
+                .unwrap(),
+            Some(Variant::Int8(7))
+        );
+        assert_eq!(
+            variant
+                .try_get_path(&VariantPath::try_from("c").unwrap())
+                .unwrap(),
+            None
+        );
+        assert!(
+            variant
+                .try_get_path(&VariantPath::try_from("b").unwrap())
+                .is_err()
+        );
     }
 
     #[test]

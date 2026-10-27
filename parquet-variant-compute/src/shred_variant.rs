@@ -1300,7 +1300,7 @@ mod tests {
         assert!(!value_field.is_null(1)); // value should contain original
         assert!(typed_value_field.is_null(1)); // typed_value should be null
         assert_eq!(
-            variant_from_arrays_at(metadata_field, value_field, 1).unwrap(),
+            variant_from_arrays_at(metadata_field, value_field, 1, true).unwrap(),
             Variant::from("hello")
         );
 
@@ -1316,7 +1316,7 @@ mod tests {
         assert!(!result.is_null(4));
         assert!(!value_field.is_null(4)); // should contain Variant::Null
         assert_eq!(
-            variant_from_arrays_at(metadata_field, value_field, 4).unwrap(),
+            variant_from_arrays_at(metadata_field, value_field, 4, true).unwrap(),
             Variant::Null
         );
         assert!(typed_value_field.is_null(4));
@@ -1393,7 +1393,7 @@ mod tests {
         assert!(value.is_valid(1));
         assert!(typed_value.is_null(1));
         assert_eq!(
-            variant_from_arrays_at(metadata, value, 1).unwrap(),
+            variant_from_arrays_at(metadata, value, 1, true).unwrap(),
             Variant::from(42i64)
         );
 
@@ -1407,7 +1407,7 @@ mod tests {
         assert!(value.is_valid(3));
         assert!(typed_value.is_null(3));
         assert_eq!(
-            variant_from_arrays_at(metadata, value, 3).unwrap(),
+            variant_from_arrays_at(metadata, value, 3, true).unwrap(),
             Variant::Null
         );
 
@@ -1449,7 +1449,7 @@ mod tests {
         assert!(value.is_valid(1));
         assert!(typed_value.is_null(1));
         assert_eq!(
-            variant_from_arrays_at(metadata, value, 1).unwrap(),
+            variant_from_arrays_at(metadata, value, 1, true).unwrap(),
             Variant::from("not_binary")
         );
 
@@ -1463,7 +1463,7 @@ mod tests {
         assert!(value.is_valid(3));
         assert!(typed_value.is_null(3));
         assert_eq!(
-            variant_from_arrays_at(metadata, value, 3).unwrap(),
+            variant_from_arrays_at(metadata, value, 3, true).unwrap(),
             Variant::Null
         );
 
@@ -2030,7 +2030,7 @@ mod tests {
             metadata: &'m dyn Array,
             value: &'v dyn Array,
         ) -> Variant<'m, 'v> {
-            variant_from_arrays_at(metadata, value, i).unwrap()
+            variant_from_arrays_at(metadata, value, i, true).unwrap()
         }
         let expect = |i, expected_result: Option<ShreddedValue<ShreddedStruct>>| {
             match expected_result {
@@ -2325,7 +2325,7 @@ mod tests {
         assert!(value_field.is_null(2));
         assert!(value_field.is_valid(3));
         assert_eq!(
-            variant_from_arrays_at(result.metadata_column(), value_field, 3).unwrap(),
+            variant_from_arrays_at(result.metadata_column(), value_field, 3, true).unwrap(),
             Variant::from("not an object")
         );
         assert!(value_field.is_null(4));
@@ -2505,7 +2505,7 @@ mod tests {
         assert_eq!(session_id_typed_value.value(1), mock_uuid_3.as_bytes());
 
         // Verify the value field contains the name field
-        let row_1_variant = variant_from_arrays_at(metadata, value, 1).unwrap();
+        let row_1_variant = variant_from_arrays_at(metadata, value, 1, true).unwrap();
         let Variant::Object(obj) = row_1_variant else {
             panic!("Expected object");
         };
@@ -2537,7 +2537,8 @@ mod tests {
 
         assert!(session_id_value.is_valid(3)); // type mismatch, stored in value
         assert!(session_id_typed_value.is_null(3));
-        let session_id_variant = variant_from_arrays_at(metadata, session_id_value, 3).unwrap();
+        let session_id_variant =
+            variant_from_arrays_at(metadata, session_id_value, 3, true).unwrap();
         assert_eq!(session_id_variant, Variant::from("not-a-uuid"));
 
         // Row 4: Type mismatch - id is int64, not UUID
@@ -2548,7 +2549,7 @@ mod tests {
 
         assert!(id_value.is_valid(4)); // type mismatch, stored in value
         assert!(id_typed_value.is_null(4));
-        let id_variant = variant_from_arrays_at(metadata, id_value, 4).unwrap();
+        let id_variant = variant_from_arrays_at(metadata, id_value, 4, true).unwrap();
         assert_eq!(id_variant, Variant::from(12345i64));
 
         assert!(session_id_value.is_null(4));

@@ -299,7 +299,10 @@ impl<'m, 'v> VariantList<'m, 'v> {
     }
 
     // Fallible version of `get`, performing only basic (constant-time) validation.
-    fn try_get_with_shallow_validation(&self, index: usize) -> Result<Variant<'m, 'v>, ArrowError> {
+    pub(crate) fn try_get_with_shallow_validation(
+        &self,
+        index: usize,
+    ) -> Result<Variant<'m, 'v>, ArrowError> {
         // Fetch the value bytes between the two offsets for this index, from the value array region
         // of the byte buffer
         let byte_range = self.get_offset(index)? as _..self.get_offset(index + 1)? as _;

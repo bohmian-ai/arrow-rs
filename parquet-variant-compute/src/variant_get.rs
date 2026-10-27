@@ -248,6 +248,7 @@ fn shredded_get_path(
             } else {
                 as_field.map(|f| f.data_type())
             };
+            let walks_path = !path.is_empty();
             let mut builder = make_variant_to_arrow_row_builder(
                 target.metadata_column(),
                 path,
@@ -257,9 +258,14 @@ fn shredded_get_path(
             )?;
             // A row that cannot be read is invalid input, not a failed cast, so it is an error
             // even when `cast_options.safe` is set.
+            // With a path left to walk, each row is read with constant-cost checks and the
+            // path builder validates only what the path reaches, so a lookup costs the path's
+            // depth rather than the row's whole Variant.
             for i in 0..target.len() {
                 if target.is_null(i) {
                     builder.append_null()?;
+                } else if walks_path {
+                    builder.append_value(target.try_value_unvalidated(i)?)?;
                 } else {
                     builder.append_value(target.try_value(i)?)?;
                 }

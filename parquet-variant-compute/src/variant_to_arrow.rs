@@ -1190,8 +1190,9 @@ impl VariantPathRowBuilder<'_> {
         self.builder.append_null()
     }
 
+    // `value` may be unvalidated: the fallible walk validates only what the path reaches.
     fn append_value(&mut self, value: Variant<'_, '_>) -> Result<bool> {
-        if let Some(v) = value.get_path(&self.path) {
+        if let Some(v) = value.try_get_path(&self.path)? {
             self.builder.append_value(v)
         } else {
             self.builder.append_null()?;

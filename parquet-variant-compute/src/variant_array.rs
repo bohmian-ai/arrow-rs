@@ -72,23 +72,27 @@ pub(crate) fn binary_array_value(array: &dyn Array, index: usize) -> Option<&[u8
     }
 }
 
-/// Returns a fully [validated] [`Variant`] from `metadata` and `value` byte arrays.
+/// Returns a [`Variant`] from `metadata` and `value` byte arrays, fully [validated] when
+/// `validate` is set and otherwise checked only at constant cost ([unvalidated]).
 ///
-/// Errors if either array is not binary-like, or if the bytes are not a valid variant, including
-/// one nested more than [`MAX_NESTING_DEPTH`] deep.
+/// Errors if either array is not binary-like, or if the bytes fail the requested validation,
+/// which in full includes a variant nested more than [`MAX_NESTING_DEPTH`] deep.
 ///
 /// [validated]: Variant#Validation
+/// [unvalidated]: Variant#Validation
 /// [`MAX_NESTING_DEPTH`]: parquet_variant::MAX_NESTING_DEPTH
 pub(crate) fn variant_from_arrays_at<'m, 'v>(
     metadata: &'m dyn Array,
     value: &'v dyn Array,
     index: usize,
+    validate: bool,
 ) -> Result<Variant<'m, 'v>> {
     match (
         binary_array_value(metadata, index),
         binary_array_value(value, index),
     ) {
-        (Some(metadata), Some(value)) => Variant::try_new(metadata, value),
+        (Some(metadata), Some(value)) if validate => Variant::try_new(metadata, value),
+        (Some(metadata), Some(value)) => Variant::try_new_with_shallow_validation(metadata, value),
         _ => Err(ArrowError::InvalidArgumentError(format!(
             "metadata and value fields must be binary-like arrays, instead got {} and {}",
             metadata.data_type(),
@@ -497,6 +501,18 @@ impl VariantArray {
     /// [`MAX_NESTING_DEPTH`]: parquet_variant::MAX_NESTING_DEPTH
     /// [validated]: Variant#Validation
     pub fn try_value(&self, index: usize) -> Result<Variant<'_, '_>> {
+        self.try_value_with(index, true)
+    }
+
+    /// [`Self::try_value`] with only constant-cost validation of unshredded `metadata`/`value`
+    /// bytes, for a caller that reads the result only through fallible accessors such as
+    /// [`Variant::try_get_path`], which validate what they reach.
+    pub(crate) fn try_value_unvalidated(&self, index: usize) -> Result<Variant<'_, '_>> {
+        self.try_value_with(index, false)
+    }
+
+    // Shared body of `try_value` and `try_value_unvalidated`.
+    fn try_value_with(&self, index: usize, validate: bool) -> Result<Variant<'_, '_>> {
         if self.len() <= index {
             return Err(ArrowError::InvalidArgumentError(format!(
                 "Index {index} out of bounds for VariantArray of length {}",
@@ -518,7 +534,9 @@ impl VariantArray {
                 typed_value_to_variant(typed_value, index)
             }
             // Otherwise fall back to value, if available
-            _ if value.is_valid(index) => variant_from_arrays_at(&self.metadata, value, index),
+            _ if value.is_valid(index) => {
+                variant_from_arrays_at(&self.metadata, value, index, validate)
+            }
             // It is technically invalid for both value and typed_value to be null,
             // but the spec specifically requires readers to return Variant::Null in this case.
             _ => Ok(Variant::Null),

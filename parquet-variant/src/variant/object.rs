@@ -376,6 +376,30 @@ impl<'m, 'v> VariantObject<'m, 'v> {
         self.header.field_offset_size.unpack_u32(field_offsets, i)
     }
 
+    /// Looks up the field named `name`, validating only what the lookup reads.
+    ///
+    /// Each probed field name and the returned value's header are checked at constant cost, so
+    /// a lookup on corrupted bytes returns an error instead of panicking. The returned value is
+    /// not otherwise validated; callers must validate it in full before traversing it with
+    /// infallible accessors. Returns `Ok(None)` if the field does not exist.
+    pub(crate) fn try_get_with_shallow_validation(
+        &self,
+        name: &str,
+    ) -> Result<Option<Variant<'m, 'v>>, ArrowError> {
+        let (mut start, mut end) = (0, self.len());
+        while start < end {
+            let mid = start + (end - start) / 2;
+            match self.try_field_name(mid)?.cmp(name) {
+                std::cmp::Ordering::Equal => {
+                    return self.try_field_with_shallow_validation(mid).map(Some);
+                }
+                std::cmp::Ordering::Greater => end = mid,
+                std::cmp::Ordering::Less => start = mid + 1,
+            }
+        }
+        Ok(None)
+    }
+
     /// Get a field's name by index in `0..self.len()`
     ///
     /// # Panics
