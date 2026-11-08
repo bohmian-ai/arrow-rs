@@ -302,6 +302,29 @@ impl VariantValueArrayBuilder {
         }
     }
 
+    /// Makes room for a row of at most `row` value bytes, part of an input of `total` bytes of
+    /// which `consumed` bytes came before it.
+    ///
+    /// When the buffer cannot hold the row, it reserves the rest of the input at the share of
+    /// the input written so far plus an eighth, at least the row and at most the rest of the
+    /// input, so a buffer built from uniform rows is allocated about once instead of growing by
+    /// doubling, while a mostly typed input reserves little. [`Self::build`] still drops any
+    /// unused capacity.
+    pub(crate) fn reserve_for_row(&mut self, row: usize, consumed: usize, total: usize) {
+        let written = self.value_builder.offset();
+        if self.value_builder.capacity() - written >= row {
+            return;
+        }
+        let rest = total.saturating_sub(consumed).max(row);
+        let projected = match consumed {
+            0 => row,
+            consumed => (written as u128 * rest as u128 / consumed as u128) as usize,
+        };
+        let margin = projected / 8;
+        self.value_builder
+            .reserve_exact(projected.saturating_add(margin).clamp(row, rest));
+    }
+
     /// Build the final value array
     ///
     /// Returns a [`BinaryViewArray`] containing the serialized variant values.

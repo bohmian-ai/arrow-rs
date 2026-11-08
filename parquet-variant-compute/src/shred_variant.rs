@@ -17,7 +17,7 @@
 
 //! Module for shredding VariantArray with a given schema.
 
-use crate::variant_array::{ShreddedVariantFieldArray, StructArrayBuilder};
+use crate::variant_array::{ShreddedVariantFieldArray, StructArrayBuilder, binary_array_value};
 use crate::variant_to_arrow::{
     ArrayVariantToArrowRowBuilder, PrimitiveVariantToArrowRowBuilder,
     make_primitive_variant_to_arrow_row_builder,
@@ -89,11 +89,20 @@ pub(crate) fn shred_variant_with_options(
         NullValue::TopLevelVariant,
         true,
     )?;
+    // Each row's residual is at most its own value bytes, so the input's value bytes size the
+    // top-level residual; nested residuals keep growing on demand.
+    let values = array.value_column().as_ref();
+    let row_bytes = |row| binary_array_value(values, row).map_or(0, <[u8]>::len);
+    let total = (0..array.len()).map(row_bytes).sum();
+    let mut consumed = 0;
     for i in 0..array.len() {
         if array.is_null(i) {
             builder.append_null()?;
         } else {
+            let row = row_bytes(i);
+            builder.reserve_for_row(row, consumed, total);
             builder.append_value(array.try_value(i)?)?;
+            consumed += row;
         }
     }
     let (value, typed_value, nulls) = builder.finish()?;
@@ -229,6 +238,18 @@ impl VariantToShreddedVariantRowBuilder<'_> {
             Array(b) => b.append_value(value),
             Object(b) => b.append_value(value),
         }
+    }
+
+    /// Makes room in this builder's own residual for a row; see
+    /// [`VariantValueArrayBuilder::reserve_for_row`].
+    fn reserve_for_row(&mut self, row: usize, consumed: usize, total: usize) {
+        use VariantToShreddedVariantRowBuilder::*;
+        let value_builder = match self {
+            Primitive(b) => &mut b.value_builder,
+            Array(b) => &mut b.value_builder,
+            Object(b) => &mut b.value_builder,
+        };
+        value_builder.reserve_for_row(row, consumed, total);
     }
 
     pub fn finish(self) -> Result<(BinaryViewArray, ArrayRef, Option<NullBuffer>)> {
@@ -3269,5 +3290,125 @@ mod tests {
                 .collect::<Vec<bool>>();
             assert_shred_type!(data_type, expected_bits);
         }
+    }
+
+    /// Counts the bytes each test thread requests from the system allocator, so a test can
+    /// observe how much a shredding call allocates; a shrinking `realloc` requests nothing.
+    struct CountingAllocator;
+
+    std::thread_local! {
+        static ALLOCATED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    impl CountingAllocator {
+        fn charge(bytes: usize) {
+            let _ = ALLOCATED.try_with(|count| count.set(count.get() + bytes));
+        }
+    }
+
+    // SAFETY: every method forwards to `System` unchanged; counting touches only a
+    // const-initialized thread-local `Cell` without a destructor.
+    unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+            Self::charge(layout.size());
+            unsafe { std::alloc::System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+            unsafe { std::alloc::System.dealloc(ptr, layout) }
+        }
+
+        unsafe fn realloc(
+            &self,
+            ptr: *mut u8,
+            layout: std::alloc::Layout,
+            new_size: usize,
+        ) -> *mut u8 {
+            if new_size > layout.size() {
+                Self::charge(new_size);
+            }
+            unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+    /// Bytes this thread requests while `work` runs, with its result.
+    fn allocated_by<T>(work: impl FnOnce() -> T) -> (T, usize) {
+        let before = ALLOCATED.get();
+        let result = work();
+        (result, ALLOCATED.get() - before)
+    }
+
+    /// Total bytes of the binary `value` column of an unshredded `array`.
+    fn value_bytes(array: &VariantArray) -> usize {
+        (0..array.len())
+            .filter_map(|row| binary_array_value(array.value_column().as_ref(), row))
+            .map(<[u8]>::len)
+            .sum()
+    }
+
+    /// Asserts that `shredded` holds exactly the logical rows of `input`.
+    fn assert_same_rows(input: &VariantArray, shredded: &VariantArray) {
+        let unshredded = crate::unshred_variant(shredded).unwrap();
+        assert_eq!(unshredded.len(), input.len());
+        for row in 0..input.len() {
+            assert_eq!(unshredded.is_null(row), input.is_null(row), "row {row}");
+            if !input.is_null(row) {
+                assert_eq!(unshredded.value(row), input.value(row), "row {row}");
+            }
+        }
+    }
+
+    /// A large residual is written into a buffer reserved from the rows it is built from
+    /// rather than grown from empty, while a mostly typed input reserves no whole-input
+    /// residual; every row keeps its logical value and physical validity.
+    #[test]
+    fn residual_encoding_reuses_storage_with_bounded_capacity() {
+        let body: &'static str = "x".repeat(64 * 1024).leak();
+        let rows = (0..32)
+            .map(|id| {
+                VariantRow::Object(vec![
+                    ("id", VariantValue::from(id as i64)),
+                    ("body", VariantValue::from(body)),
+                    (
+                        "extra",
+                        VariantValue::Object(vec![("k", VariantValue::from(true))]),
+                    ),
+                ])
+            })
+            .collect();
+        let input = build_variant_array(rows);
+        let input_bytes = value_bytes(&input);
+
+        let residual_heavy = ShreddedSchemaBuilder::new()
+            .with_path("id", &DataType::Int64)
+            .unwrap()
+            .build();
+        let (shredded, allocated) =
+            allocated_by(|| shred_variant(&input, &residual_heavy).unwrap());
+        assert_same_rows(&input, &shredded);
+        assert!(
+            shredded.value_column().nulls().is_none(),
+            "every row keeps a residual"
+        );
+        assert!(
+            allocated < input_bytes + input_bytes / 4,
+            "residual growth: {allocated} bytes for {input_bytes} input bytes"
+        );
+
+        let mostly_typed = ShreddedSchemaBuilder::new()
+            .with_path("id", &DataType::Int64)
+            .unwrap()
+            .with_path("body", &DataType::Utf8)
+            .unwrap()
+            .build();
+        let (shredded, allocated) = allocated_by(|| shred_variant(&input, &mostly_typed).unwrap());
+        assert_same_rows(&input, &shredded);
+        assert!(
+            allocated < input_bytes * 5 / 2,
+            "no whole-input residual reservation: {allocated} bytes for {input_bytes} input bytes"
+        );
     }
 }

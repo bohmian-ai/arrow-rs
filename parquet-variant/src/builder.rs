@@ -97,6 +97,16 @@ impl ValueBuilder {
     pub fn with_capacity(bytes: usize) -> Self {
         Self(Vec::with_capacity(bytes))
     }
+
+    /// Returns how many bytes the underlying `Vec` holds without reallocating
+    pub fn capacity(&self) -> usize {
+        self.0.capacity()
+    }
+
+    /// Reserves room for exactly `additional` more bytes, as [`Vec::reserve_exact`] does
+    pub fn reserve_exact(&mut self, additional: usize) {
+        self.0.reserve_exact(additional);
+    }
 }
 
 /// Macro to generate the match statement for each append_variant, try_append_variant, and
