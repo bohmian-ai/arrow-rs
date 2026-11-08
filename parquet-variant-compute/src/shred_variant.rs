@@ -23,8 +23,8 @@ use crate::variant_to_arrow::{
     make_primitive_variant_to_arrow_row_builder,
 };
 use crate::{VariantArray, VariantValueArrayBuilder};
-use arrow::array::{ArrayRef, BinaryViewArray, NullBufferBuilder};
-use arrow::buffer::NullBuffer;
+use arrow::array::{Array, ArrayRef, AsArray, BinaryViewArray, ByteView, NullBufferBuilder};
+use arrow::buffer::{Buffer, NullBuffer};
 use arrow::compute::CastOptions;
 use arrow::datatypes::{DataType, Field, FieldRef, Fields, TimeUnit};
 use arrow::error::{ArrowError, Result};
@@ -101,7 +101,7 @@ pub(crate) fn shred_variant_with_options(
         } else {
             let row = row_bytes(i);
             builder.reserve_for_row(row, consumed, total);
-            builder.append_value(array.try_value(i)?)?;
+            builder.append_stored(array.try_value(i)?, StoredValue::of(values, i))?;
             consumed += row;
         }
     }
@@ -112,6 +112,72 @@ pub(crate) fn shred_variant_with_options(
         Some(typed_value),
         nulls,
     ))
+}
+
+/// A top-level input row's value bytes, located in the input buffer that holds them, so a
+/// residual left untouched by shredding can reference them instead of copying them.
+#[derive(Clone, Copy)]
+struct StoredValue<'a> {
+    buffer: &'a Buffer,
+    offset: usize,
+    len: usize,
+}
+
+impl<'a> StoredValue<'a> {
+    /// Locates row `index` of a `Binary`, `LargeBinary` or out-of-line `BinaryView` value
+    /// column; `None` for null, inline, encoded, or `u32`-unaddressable values, which are copied.
+    fn of(values: &'a dyn Array, index: usize) -> Option<Self> {
+        if values.is_null(index) {
+            return None;
+        }
+        let (buffer, offset, len) = match values.data_type() {
+            DataType::Binary => {
+                let values = values.as_binary::<i32>();
+                let offsets = values.value_offsets();
+                let offset = offsets[index] as usize;
+                (
+                    values.values(),
+                    offset,
+                    offsets[index + 1] as usize - offset,
+                )
+            }
+            DataType::LargeBinary => {
+                let values = values.as_binary::<i64>();
+                let offsets = values.value_offsets();
+                let offset = usize::try_from(offsets[index]).ok()?;
+                let end = usize::try_from(offsets[index + 1]).ok()?;
+                (values.values(), offset, end - offset)
+            }
+            DataType::BinaryView => {
+                let values = values.as_binary_view();
+                let view = values.views()[index];
+                if (view as u32) <= 12 {
+                    return None;
+                }
+                let view = ByteView::from(view);
+                let buffer = &values.data_buffers()[view.buffer_index as usize];
+                (buffer, view.offset as usize, view.length as usize)
+            }
+            _ => return None,
+        };
+        (u32::try_from(offset + len).is_ok() && len > 12).then_some(Self {
+            buffer,
+            offset,
+            len,
+        })
+    }
+
+    /// Appends `value` to `builder`, referencing these bytes when present.
+    fn append(
+        stored: Option<Self>,
+        builder: &mut VariantValueArrayBuilder,
+        value: Variant<'_, '_>,
+    ) {
+        match stored {
+            Some(stored) => builder.append_shared(stored.buffer, stored.offset, stored.len),
+            None => builder.append_value(value),
+        }
+    }
 }
 
 /// Controls how `append_null` is encoded for a shredded `(value, typed_value)` pair.
@@ -232,11 +298,20 @@ impl VariantToShreddedVariantRowBuilder<'_> {
     }
 
     pub fn append_value(&mut self, value: Variant<'_, '_>) -> Result<bool> {
+        self.append_stored(value, None)
+    }
+
+    /// Appends a top-level row whose bytes are `stored`, which an untouched residual references.
+    fn append_stored(
+        &mut self,
+        value: Variant<'_, '_>,
+        stored: Option<StoredValue<'_>>,
+    ) -> Result<bool> {
         use VariantToShreddedVariantRowBuilder::*;
         match self {
-            Primitive(b) => b.append_value(value),
-            Array(b) => b.append_value(value),
-            Object(b) => b.append_value(value),
+            Primitive(b) => b.append_value(value, stored),
+            Array(b) => b.append_value(value, stored),
+            Object(b) => b.append_value(value, stored),
         }
     }
 
@@ -290,12 +365,16 @@ impl<'a> VariantToShreddedPrimitiveVariantRowBuilder<'a> {
         self.typed_value_builder.append_null()
     }
 
-    fn append_value(&mut self, value: Variant<'_, '_>) -> Result<bool> {
+    fn append_value(
+        &mut self,
+        value: Variant<'_, '_>,
+        stored: Option<StoredValue<'_>>,
+    ) -> Result<bool> {
         self.nulls.append_non_null();
         if self.typed_value_builder.append_value(&value)? {
             self.value_builder.append_null();
         } else {
-            self.value_builder.append_value(value);
+            StoredValue::append(stored, &mut self.value_builder, value);
         }
         Ok(true)
     }
@@ -343,7 +422,11 @@ impl<'a> VariantToShreddedArrayVariantRowBuilder<'a> {
         Ok(())
     }
 
-    fn append_value(&mut self, variant: Variant<'_, '_>) -> Result<bool> {
+    fn append_value(
+        &mut self,
+        variant: Variant<'_, '_>,
+        stored: Option<StoredValue<'_>>,
+    ) -> Result<bool> {
         // If the variant is not an array, typed_value must be null.
         // If the variant is an array, value must be null.
         match variant {
@@ -358,7 +441,7 @@ impl<'a> VariantToShreddedArrayVariantRowBuilder<'a> {
             }
             other => {
                 self.nulls.append_non_null();
-                self.value_builder.append_value(other);
+                StoredValue::append(stored, &mut self.value_builder, other);
                 self.typed_value_builder.append_null()?;
                 Ok(false)
             }
@@ -424,17 +507,37 @@ impl<'a> VariantToShreddedObjectVariantRowBuilder<'a> {
         Ok(())
     }
 
-    fn append_value(&mut self, value: Variant<'_, '_>) -> Result<bool> {
+    fn append_value(
+        &mut self,
+        value: Variant<'_, '_>,
+        stored: Option<StoredValue<'_>>,
+    ) -> Result<bool> {
         let Variant::Object(ref obj) = value else {
             // Not an object => fall back
             self.nulls.append_non_null();
-            self.value_builder.append_value(value);
+            StoredValue::append(stored, &mut self.value_builder, value);
             self.typed_value_nulls.append_null();
             for (_, typed_value_builder) in &mut self.typed_value_builders {
                 typed_value_builder.append_null()?;
             }
             return Ok(false);
         };
+
+        // A stored non-empty object without any shredded field is its own residual.
+        if let Some(stored) = stored.filter(|_| {
+            !obj.is_empty()
+                && obj
+                    .iter()
+                    .all(|(name, _)| !self.typed_value_builders.contains_key(name))
+        }) {
+            for (_, typed_value_builder) in &mut self.typed_value_builders {
+                typed_value_builder.append_null()?;
+            }
+            StoredValue::append(Some(stored), &mut self.value_builder, value);
+            self.typed_value_nulls.append_non_null();
+            self.nulls.append_non_null();
+            return Ok(true);
+        }
 
         // Route the object's fields by name as either shredded or unshredded
         let Self {
@@ -3409,6 +3512,93 @@ mod tests {
         assert!(
             allocated < input_bytes * 5 / 2,
             "no whole-input residual reservation: {allocated} bytes for {input_bytes} input bytes"
+        );
+
+        // Untouched rows reference the input's value bytes; every other row is rebuilt.
+        use arrow::array::AsArray;
+        let object =
+            |fields: Vec<(&'static str, VariantValue<'static>)>| VariantRow::Object(fields);
+        let rows = vec![
+            VariantRow::Value(VariantValue::from(body)),
+            object(vec![("body", VariantValue::from(body))]),
+            object(vec![
+                ("id", VariantValue::from(1i64)),
+                ("body", VariantValue::from(body)),
+            ]),
+            object(vec![
+                ("id", VariantValue::from("one")),
+                ("body", VariantValue::from(body)),
+            ]),
+            object(vec![]),
+            VariantRow::Null,
+            VariantRow::Value(VariantValue::from(Variant::Null)),
+            VariantRow::List(vec![VariantValue::from(body), VariantValue::from(2i64)]),
+            object(vec![(
+                "nested",
+                VariantValue::Object(vec![("id", VariantValue::from(body))]),
+            )]),
+            VariantRow::Value(VariantValue::from(7i64)),
+        ];
+        let input = build_variant_array(rows);
+        let shredded = shred_variant(&input, &residual_heavy).unwrap();
+        assert_same_rows(&input, &shredded);
+        let value = shredded.value_column().as_binary_view();
+        let typed = shredded.typed_value_column().unwrap().as_struct();
+        let id = ShreddedVariantFieldArray::try_new(typed.column_by_name("id").unwrap()).unwrap();
+        let input_value = input.value_column().as_binary_view();
+        let shared = |row: usize| value.value(row).as_ptr() == input_value.value(row).as_ptr();
+        // (shared, value valid, typed object valid, id value valid, id typed valid)
+        let expected = [
+            (true, true, false, false, false),
+            (true, true, true, false, false),
+            (false, true, true, false, true),
+            (false, true, true, true, false),
+            (false, false, true, false, false),
+            (false, false, false, false, false),
+            (false, true, false, false, false),
+            (true, true, false, false, false),
+            (true, true, true, false, false),
+            (false, true, false, false, false),
+        ];
+        for (row, expected) in expected.into_iter().enumerate() {
+            let observed = (
+                value.is_valid(row) && shared(row),
+                value.is_valid(row),
+                typed.is_valid(row),
+                id.value_column().is_valid(row),
+                id.typed_value_column()
+                    .is_some_and(|column| column.is_valid(row)),
+            );
+            assert_eq!(observed, expected, "row {row}");
+        }
+        assert_eq!(
+            shred_variant(&input, &residual_heavy).unwrap().inner(),
+            shredded.inner(),
+            "shredding the same rows again builds the same arrays"
+        );
+
+        // A few untouched rows never keep a mostly unused input buffer alive.
+        let mut rows: Vec<_> = (0..8)
+            .map(|id| {
+                object(vec![
+                    ("id", VariantValue::from(id as i64)),
+                    ("body", VariantValue::from(body)),
+                ])
+            })
+            .collect();
+        rows.push(object(vec![("body", VariantValue::from(body))]));
+        let input = build_variant_array(rows);
+        let shredded = shred_variant(&input, &residual_heavy).unwrap();
+        assert_same_rows(&input, &shredded);
+        let input_buffer = input.value_column().as_binary_view().data_buffers()[0].as_ptr();
+        assert!(
+            shredded
+                .value_column()
+                .as_binary_view()
+                .data_buffers()
+                .iter()
+                .all(|buffer| buffer.as_ptr() != input_buffer),
+            "a sparsely referenced input buffer is copied rather than retained"
         );
     }
 }

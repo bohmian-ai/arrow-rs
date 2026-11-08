@@ -284,6 +284,20 @@ pub struct VariantValueArrayBuilder {
     value_builder: ValueBuilder,
     value_offsets: Vec<usize>,
     nulls: NullBufferBuilder,
+    /// Input buffers that rows appended by [`Self::append_shared`] reference.
+    shared_buffers: Vec<Buffer>,
+    /// Each referencing row, its index in `shared_buffers`, and its byte range there.
+    shared_rows: Vec<SharedRow>,
+}
+
+/// A row whose value bytes stay in an input buffer; see
+/// [`VariantValueArrayBuilder::append_shared`].
+#[derive(Debug)]
+struct SharedRow {
+    row: usize,
+    buffer: usize,
+    offset: usize,
+    len: usize,
 }
 
 impl VariantValueArrayBuilder {
@@ -299,7 +313,38 @@ impl VariantValueArrayBuilder {
             value_builder: ValueBuilder::with_capacity(byte_capacity),
             value_offsets: Vec::with_capacity(row_capacity),
             nulls: NullBufferBuilder::new(row_capacity),
+            shared_buffers: Vec::new(),
+            shared_rows: Vec::new(),
         }
+    }
+
+    /// Appends a row whose complete value is `buffer[offset..offset + len]` of an input array,
+    /// referencing those bytes instead of copying them.
+    ///
+    /// The bytes must be a whole Variant value encoded against the metadata this row is built
+    /// with, and `offset + len` must fit a view's `u32` offset. [`Self::build`] keeps the
+    /// reference only when the referenced bytes are at least half of the buffer's allocation,
+    /// so a few rows never keep a mostly unused input buffer alive; otherwise it copies them.
+    pub(crate) fn append_shared(&mut self, buffer: &Buffer, offset: usize, len: usize) {
+        let index = match self
+            .shared_buffers
+            .iter()
+            .position(|shared| shared.ptr_eq(buffer))
+        {
+            Some(index) => index,
+            None => {
+                self.shared_buffers.push(buffer.clone());
+                self.shared_buffers.len() - 1
+            }
+        };
+        self.shared_rows.push(SharedRow {
+            row: self.value_offsets.len(),
+            buffer: index,
+            offset,
+            len,
+        });
+        self.value_offsets.push(self.value_builder.offset());
+        self.nulls.append_non_null();
     }
 
     /// Makes room for a row of at most `row` value bytes, part of an input of `total` bytes of
@@ -329,16 +374,64 @@ impl VariantValueArrayBuilder {
     ///
     /// Returns a [`BinaryViewArray`] containing the serialized variant values.
     /// This can be combined with existing metadata to create a complete [`VariantArray`].
-    pub fn build(mut self) -> Result<BinaryViewArray, ArrowError> {
-        let mut value_buffer = self.value_builder.into_inner();
+    pub fn build(self) -> Result<BinaryViewArray, ArrowError> {
+        let Self {
+            value_builder,
+            value_offsets,
+            mut nulls,
+            shared_buffers,
+            shared_rows,
+        } = self;
+        let mut value_buffer = value_builder.into_inner();
+        // A buffer stays referenced only when its rows use at least half of its allocation; the
+        // rows of every other buffer are copied after the built rows.
+        let mut used = vec![0_usize; shared_buffers.len()];
+        for shared in &shared_rows {
+            used[shared.buffer] += shared.len;
+        }
+        let mut buffers = Vec::with_capacity(shared_buffers.len() + 1);
+        let mut index = Vec::with_capacity(shared_buffers.len());
+        let mut copied = 0;
+        for (buffer, used) in shared_buffers.iter().zip(used) {
+            if used.saturating_mul(2) >= buffer.capacity().max(buffer.len()) {
+                buffers.push(buffer.clone());
+                index.push(Some(buffers.len() as u32));
+            } else {
+                copied += used;
+                index.push(None);
+            }
+        }
+        value_buffer.reserve_exact(copied);
+        let mut patches = Vec::with_capacity(shared_rows.len());
+        for shared in &shared_rows {
+            let end = shared.offset + shared.len;
+            let patch = match index[shared.buffer] {
+                Some(buffer) => (buffer, shared.offset),
+                None => {
+                    let start = value_buffer.len();
+                    value_buffer
+                        .extend_from_slice(&shared_buffers[shared.buffer][shared.offset..end]);
+                    (0, start)
+                }
+            };
+            patches.push(patch);
+        }
+        drop(shared_buffers);
         // The array keeps the whole allocation alive, so drop any unused capacity.
         value_buffer.shrink_to_fit();
-        let mut array = binary_view_array_from_buffers(value_buffer, self.value_offsets);
-        if let Some(nulls) = self.nulls.finish() {
-            let (views, buffers, _) = array.into_parts();
-            array = BinaryViewArray::try_new(views, buffers, Some(nulls))?;
+        let array = binary_view_array_from_buffers(value_buffer, value_offsets);
+        let nulls = nulls.finish();
+        if shared_rows.is_empty() && nulls.is_none() {
+            return Ok(array);
         }
-        Ok(array)
+        let (views, own, _) = array.into_parts();
+        let mut views = views.to_vec();
+        buffers.insert(0, own[0].clone());
+        for (shared, (buffer, offset)) in shared_rows.iter().zip(patches) {
+            let bytes = &buffers[buffer as usize][offset..offset + shared.len];
+            views[shared.row] = make_view(bytes, buffer, offset as u32);
+        }
+        BinaryViewArray::try_new(views.into(), buffers, nulls)
     }
 
     /// Append a null row to the builder
