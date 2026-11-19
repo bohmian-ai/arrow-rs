@@ -19,8 +19,8 @@
 
 use crate::VariantArray;
 use arrow::array::builder::make_view;
-use arrow::array::{ArrayRef, BinaryViewArray, NullBufferBuilder, StructArray};
-use arrow::buffer::Buffer;
+use arrow::array::{ArrayRef, BinaryArray, BinaryViewArray, NullBufferBuilder, StructArray};
+use arrow::buffer::{Buffer, OffsetBuffer};
 use arrow_schema::{ArrowError, DataType, Field, Fields};
 use parquet_variant::{
     BuilderSpecificState, ListBuilder, MetadataBuilder, ObjectBuilder, Variant, VariantBuilderExt,
@@ -36,8 +36,8 @@ use std::sync::Arc;
 /// This builder is used to construct a `VariantArray` and allows APIs for
 /// adding metadata
 ///
-/// This builder always creates a `VariantArray` using [`BinaryViewArray`] for both
-/// the metadata and value fields.
+/// [`Self::build`] creates a `VariantArray` using [`BinaryViewArray`] for both the metadata and
+/// value fields; [`Self::build_binary`] uses [`BinaryArray`] instead.
 ///
 /// `VariantArrayBuilder` implements [`VariantBuilderExt`], so you append values
 /// and nested objects or lists the same way as when building a single
@@ -158,6 +158,94 @@ impl VariantArrayBuilder {
         VariantArray::try_new(&inner).expect("valid VariantArray by construction")
     }
 
+    /// Build the final array with [`BinaryArray`] `metadata` and `value` children.
+    ///
+    /// The children take ownership of the builder's byte buffers without copying them and the
+    /// row boundaries become their `i32` offsets, so each row holds exactly the bytes and
+    /// validity that [`Self::build`] gives it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArrowError::OffsetOverflowError`] when either buffer exceeds `i32::MAX` bytes.
+    pub fn build_binary(self) -> Result<VariantArray, ArrowError> {
+        let Self {
+            mut nulls,
+            metadata_builder,
+            metadata_offsets,
+            value_builder,
+            value_offsets,
+            fields: _,
+        } = self;
+
+        let metadata = binary_array_from_buffers(metadata_builder.into_inner(), metadata_offsets)?;
+        let value = binary_array_from_buffers(value_builder.into_inner(), value_offsets)?;
+        let fields = Fields::from(vec![
+            Field::new("metadata", DataType::Binary, false),
+            Field::new("value", DataType::Binary, false),
+        ]);
+        let inner = StructArray::try_new(
+            fields,
+            vec![Arc::new(metadata) as ArrayRef, Arc::new(value) as ArrayRef],
+            nulls.finish(),
+        )?;
+        VariantArray::try_new(&inner)
+    }
+
+    /// Captures the builder state after its last completed row, for [`Self::rollback`].
+    pub fn checkpoint(&self) -> VariantArrayCheckpoint {
+        VariantArrayCheckpoint {
+            rows: self.value_offsets.len(),
+            metadata_bytes: self.metadata_builder.offset(),
+            value_bytes: self.value_builder.offset(),
+            has_nulls: self.nulls.as_slice().is_some(),
+        }
+    }
+
+    /// Restores the builder to `checkpoint`, discarding every row appended since: the row
+    /// boundaries, the metadata and value bytes, and the validity, including whether any null
+    /// has been recorded. Byte and offset buffer capacity is retained.
+    ///
+    /// # Panics
+    ///
+    /// If `checkpoint` is ahead of this builder, which happens only when it was taken from
+    /// another builder or this builder was already rolled back to an earlier checkpoint.
+    pub fn rollback(&mut self, checkpoint: VariantArrayCheckpoint) {
+        let current = self.checkpoint();
+        assert!(
+            checkpoint.rows <= current.rows
+                && checkpoint.metadata_bytes <= current.metadata_bytes
+                && checkpoint.value_bytes <= current.value_bytes
+                && (current.has_nulls || !checkpoint.has_nulls),
+            "checkpoint {checkpoint:?} is ahead of this builder {current:?}"
+        );
+        self.metadata_builder.truncate(checkpoint.metadata_bytes);
+        self.metadata_offsets.truncate(checkpoint.rows);
+        self.value_builder.truncate(checkpoint.value_bytes);
+        self.value_offsets.truncate(checkpoint.rows);
+        if checkpoint.has_nulls == current.has_nulls {
+            self.nulls.truncate(checkpoint.rows);
+        } else {
+            // Only the rolled-back rows were null, so drop the bitmap they materialized: the
+            // built array then carries no validity buffer, as it would have at the checkpoint.
+            self.nulls = NullBufferBuilder::new_with_len(checkpoint.rows);
+        }
+    }
+
+    /// The `metadata` and `value` bytes of the last row, or `None` when the builder is empty or
+    /// its last row is null.
+    pub fn last_value_bytes(&self) -> Option<(&[u8], &[u8])> {
+        let row = self.value_offsets.len().checked_sub(1)?;
+        if !self.nulls.is_valid(row) {
+            return None;
+        }
+        let start = |offsets: &[usize]| row.checked_sub(1).map_or(0, |prev| offsets[prev]);
+        let metadata = &self.metadata_builder.as_bytes()
+            [start(&self.metadata_offsets)..self.metadata_offsets[row]];
+        let value =
+            &self.value_builder.as_bytes()[start(&self.value_offsets)..self.value_offsets[row]];
+        Some((metadata, value))
+    }
+
     /// Appends a null row to the builder.
     pub fn append_null(&mut self) {
         self.nulls.append_null();
@@ -193,6 +281,16 @@ impl VariantArrayBuilder {
 
         ParentState::new(&mut self.value_builder, &mut self.metadata_builder, state)
     }
+}
+
+/// A [`VariantArrayBuilder`] state at a completed-row boundary; see
+/// [`VariantArrayBuilder::checkpoint`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VariantArrayCheckpoint {
+    rows: usize,
+    metadata_bytes: usize,
+    value_bytes: usize,
+    has_nulls: bool,
 }
 
 impl<'m, 'v> Extend<Option<Variant<'m, 'v>>> for VariantArrayBuilder {
@@ -601,11 +699,237 @@ fn binary_view_array_from_buffers(buffer: Vec<u8>, offsets: Vec<usize>) -> Binar
     unsafe { BinaryViewArray::new_unchecked(views.into(), vec![buffer].into(), None) }
 }
 
+/// A [`BinaryArray`] owning `buffer`, whose rows end at `offsets`.
+///
+/// # Errors
+///
+/// Returns [`ArrowError::OffsetOverflowError`] when `buffer` is too long for `i32` offsets.
+fn binary_array_from_buffers(
+    buffer: Vec<u8>,
+    offsets: Vec<usize>,
+) -> Result<BinaryArray, ArrowError> {
+    let len = buffer.len();
+    let offset = |end: usize| i32::try_from(end).map_err(|_| ArrowError::OffsetOverflowError(len));
+    let offsets = std::iter::once(Ok(0))
+        .chain(offsets.into_iter().map(offset))
+        .collect::<Result<Vec<i32>, _>>()?;
+    BinaryArray::try_new(
+        OffsetBuffer::new(offsets.into()),
+        Buffer::from_vec(buffer),
+        None,
+    )
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
-    use arrow::array::Array;
+    use arrow::array::{Array, AsArray};
     use parquet_variant::{ShortString, Variant};
+
+    /// Appends rows covering primitives, nulls, duplicate and reverse-ordered object keys, nested
+    /// repeated keys, lists, and empty containers.
+    fn append_mixed_rows(builder: &mut VariantArrayBuilder, tag: i64) {
+        builder.append_variant(Variant::from(tag));
+        builder.append_null();
+        builder
+            .new_object()
+            .with_field("z", tag)
+            .with_field("a", "first")
+            .with_field("z", "last wins")
+            .finish();
+        {
+            let mut obj = builder.new_object();
+            let mut inner = obj.new_object("outer");
+            inner.insert("z", 1.5f64);
+            inner.insert("a", f64::NAN);
+            inner.finish();
+            obj.new_list("items")
+                .with_value(i64::MIN)
+                .with_value(u8::MAX as i32)
+                .finish();
+            obj.new_object("empty").finish();
+            obj.insert("a", Variant::Null);
+            obj.finish();
+        }
+        builder.new_list().finish();
+        builder.append_variant(Variant::from("x".repeat(70).as_str()));
+    }
+
+    /// Each row's validity and `metadata`/`value` bytes, read through whichever binary type the
+    /// children use.
+    fn rows(array: &VariantArray) -> Vec<Option<(Vec<u8>, Vec<u8>)>> {
+        let bytes = |column: &ArrayRef, row: usize| match column.data_type() {
+            DataType::Binary => column.as_binary::<i32>().value(row).to_vec(),
+            DataType::BinaryView => column.as_binary_view().value(row).to_vec(),
+            other => panic!("unexpected child type {other}"),
+        };
+        (0..array.len())
+            .map(|row| {
+                array.is_valid(row).then(|| {
+                    (
+                        bytes(array.metadata_column(), row),
+                        bytes(array.value_column(), row),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_build_binary_matches_build() {
+        let fill = |builder: &mut VariantArrayBuilder| {
+            append_mixed_rows(builder, 1);
+            append_mixed_rows(builder, 2);
+        };
+        let (mut view, mut binary) = (VariantArrayBuilder::new(0), VariantArrayBuilder::new(0));
+        fill(&mut view);
+        fill(&mut binary);
+        let view = view.build();
+        let binary = binary.build_binary().unwrap();
+
+        assert_eq!(view.metadata_column().data_type(), &DataType::BinaryView);
+        assert_eq!(binary.metadata_column().data_type(), &DataType::Binary);
+        assert_eq!(binary.value_column().data_type(), &DataType::Binary);
+        assert!(binary.metadata_column().nulls().is_none());
+        assert!(binary.value_column().nulls().is_none());
+        assert_eq!(rows(&binary), rows(&view));
+        assert_eq!(binary.nulls(), view.nulls());
+        assert_eq!(binary.value(2), view.value(2));
+
+        // Without null rows neither completion carries a validity buffer.
+        let (mut view, mut binary) = (VariantArrayBuilder::new(0), VariantArrayBuilder::new(0));
+        view.append_variant(Variant::from(7i8));
+        binary.append_variant(Variant::from(7i8));
+        let (view, binary) = (view.build(), binary.build_binary().unwrap());
+        assert!(view.nulls().is_none() && binary.nulls().is_none());
+        assert_eq!(rows(&binary), rows(&view));
+
+        let empty = VariantArrayBuilder::new(0).build_binary().unwrap();
+        assert_eq!(empty.len(), 0);
+    }
+
+    #[test]
+    fn test_last_value_bytes() {
+        let mut builder = VariantArrayBuilder::new(0);
+        assert_eq!(builder.last_value_bytes(), None);
+        builder
+            .new_object()
+            .with_field("b", 1i32)
+            .with_field("a", 2i32)
+            .finish();
+        let first = builder
+            .last_value_bytes()
+            .map(|(m, v)| (m.to_vec(), v.to_vec()));
+        builder.append_variant(Variant::from("tail"));
+        let second = builder
+            .last_value_bytes()
+            .map(|(m, v)| (m.to_vec(), v.to_vec()));
+        builder.append_null();
+        assert_eq!(builder.last_value_bytes(), None);
+
+        assert_eq!(rows(&builder.build()), vec![first, second, None]);
+    }
+
+    /// Asserts every piece of builder state equals its state at `checkpoint`.
+    fn assert_at(builder: &VariantArrayBuilder, expected: &VariantArrayBuilderSnapshot) {
+        assert_eq!(&VariantArrayBuilderSnapshot::of(builder), expected);
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct VariantArrayBuilderSnapshot {
+        nulls_len: usize,
+        nulls_bitmap: Option<Vec<u8>>,
+        metadata_offsets: Vec<usize>,
+        value_offsets: Vec<usize>,
+        metadata: Vec<u8>,
+        value: Vec<u8>,
+    }
+
+    impl VariantArrayBuilderSnapshot {
+        fn of(builder: &VariantArrayBuilder) -> Self {
+            Self {
+                nulls_len: builder.nulls.len(),
+                nulls_bitmap: builder.nulls.as_slice().map(<[u8]>::to_vec),
+                metadata_offsets: builder.metadata_offsets.clone(),
+                value_offsets: builder.value_offsets.clone(),
+                metadata: builder.metadata_builder.as_bytes().to_vec(),
+                value: builder.value_builder.as_bytes().to_vec(),
+            }
+        }
+    }
+
+    /// Appends rows to be rolled back, ending with a partial object that is dropped unfinished
+    /// and a failed nested insert.
+    fn append_discarded_rows(builder: &mut VariantArrayBuilder) {
+        append_mixed_rows(builder, 99);
+        builder.append_nulls(9);
+        {
+            let mut obj = builder.new_object();
+            obj.insert("never", "kept");
+            obj.new_object("nested").with_field("deep", 1i32).finish();
+            // dropped without finish
+        }
+        {
+            let mut obj = builder.new_object().with_validate_unique_fields(true);
+            obj.insert("dup", 1i32);
+            obj.new_list("list").with_value(1i32).finish();
+            assert!(obj.try_insert("dup", 2i32).is_err());
+            // the object is abandoned after the failed insert
+        }
+    }
+
+    #[test]
+    fn test_rollback_restores_checkpoint() {
+        // Checkpoints at an empty builder, after valid rows only, and after a null row.
+        type Prefix = fn(&mut VariantArrayBuilder);
+        let prefixes: [Prefix; 3] = [
+            |_| {},
+            |b| b.new_object().with_field("k", 1i32).finish(),
+            |b| append_mixed_rows(b, 5),
+        ];
+        for prefix in prefixes {
+            let mut clean = VariantArrayBuilder::new(0);
+            prefix(&mut clean);
+            let mut builder = VariantArrayBuilder::new(0);
+            prefix(&mut builder);
+
+            let checkpoint = builder.checkpoint();
+            let snapshot = VariantArrayBuilderSnapshot::of(&builder);
+            append_discarded_rows(&mut builder);
+            builder.rollback(checkpoint);
+            assert_at(&builder, &snapshot);
+            assert_eq!(builder.checkpoint(), checkpoint);
+
+            // Rolling back twice in a row is the same as once.
+            append_discarded_rows(&mut builder);
+            builder.rollback(checkpoint);
+            assert_at(&builder, &snapshot);
+
+            for b in [&mut builder, &mut clean] {
+                b.new_object()
+                    .with_field("never", "after")
+                    .with_field("k", 2i32)
+                    .finish();
+                b.append_variant(Variant::from(3i64));
+            }
+            let (built, expected) = (
+                builder.build_binary().unwrap(),
+                clean.build_binary().unwrap(),
+            );
+            assert_eq!(rows(&built), rows(&expected));
+            assert_eq!(built.nulls(), expected.nulls());
+            assert_eq!(built.inner().to_data(), expected.inner().to_data());
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "ahead of this builder")]
+    fn test_rollback_rejects_checkpoint_ahead_of_builder() {
+        let mut ahead = VariantArrayBuilder::new(0);
+        ahead.append_variant(Variant::from(1i32));
+        let checkpoint = ahead.checkpoint();
+        VariantArrayBuilder::new(0).rollback(checkpoint);
+    }
 
     /// Test that both the metadata and value buffers are non nullable
     #[test]

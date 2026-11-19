@@ -107,6 +107,17 @@ impl ValueBuilder {
     pub fn reserve_exact(&mut self, additional: usize) {
         self.0.reserve_exact(additional);
     }
+
+    /// The bytes written so far.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Discards bytes past `offset`, keeping the capacity; a no-op when `offset` is not less than
+    /// [`Self::offset`], as [`Vec::truncate`] does.
+    pub fn truncate(&mut self, offset: usize) {
+        self.0.truncate(offset);
+    }
 }
 
 /// Macro to generate the match statement for each append_variant, try_append_variant, and

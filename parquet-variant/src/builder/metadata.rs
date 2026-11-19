@@ -161,21 +161,47 @@ pub struct WritableMetadataBuilder {
 
 impl WritableMetadataBuilder {
     /// Upsert field name to dictionary, return its ID
+    ///
+    /// A name already in the dictionary is found by borrowed lookup, so only a new name
+    /// allocates an owned copy.
     pub fn upsert_field_name(&mut self, field_name: &str) -> u32 {
-        let (id, new_entry) = self.field_names.insert_full(field_name.to_string());
-
-        if new_entry {
-            let n = self.num_field_names();
-
-            // Dictionary sort order tracking:
-            // - An empty dictionary is unsorted (ambiguous in spec but required by interop tests)
-            // - A single-entry dictionary is trivially sorted
-            // - Otherwise, an already-sorted dictionary becomes unsorted if the new entry breaks order
-            self.is_sorted =
-                n == 1 || self.is_sorted && (self.field_names[n - 2] < self.field_names[n - 1]);
+        if let Some(id) = self.field_names.get_index_of(field_name) {
+            return id as u32;
         }
+        let (id, _) = self.field_names.insert_full(field_name.to_string());
+        let n = self.num_field_names();
+
+        // Dictionary sort order tracking:
+        // - An empty dictionary is unsorted (ambiguous in spec but required by interop tests)
+        // - A single-entry dictionary is trivially sorted
+        // - Otherwise, an already-sorted dictionary becomes unsorted if the new entry breaks order
+        self.is_sorted =
+            n == 1 || self.is_sorted && (self.field_names[n - 2] < self.field_names[n - 1]);
 
         id as u32
+    }
+
+    /// The serialized bytes of every dictionary finished so far.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.metadata_buffer
+    }
+
+    /// Discards serialized bytes past `offset` and any field names of an unfinished dictionary,
+    /// returning the builder to the state it had when [`Self::offset`] was `offset` at a
+    /// dictionary boundary. Buffer capacity is retained.
+    ///
+    /// # Panics
+    ///
+    /// If `offset` is greater than [`Self::offset`].
+    pub fn truncate(&mut self, offset: usize) {
+        assert!(
+            offset <= self.metadata_buffer.len(),
+            "metadata offset {offset} is past the buffer end {}",
+            self.metadata_buffer.len()
+        );
+        self.metadata_buffer.truncate(offset);
+        self.field_names.clear();
+        self.is_sorted = false;
     }
 
     /// The current length of the underlying metadata buffer
@@ -206,7 +232,8 @@ impl WritableMetadataBuilder {
 
     /// Finalizes the metadata dictionary and appends its serialized bytes to the underlying buffer,
     /// returning the resulting [`Self::offset`]. The builder state is reset and ready to start
-    /// building a new metadata dictionary.
+    /// building a new metadata dictionary; the dictionary table keeps its allocation but no
+    /// entries.
     pub fn finish(&mut self) -> usize {
         let nkeys = self.num_field_names();
 
@@ -215,7 +242,7 @@ impl WritableMetadataBuilder {
 
         let metadata_buffer = &mut self.metadata_buffer;
         let is_sorted = std::mem::take(&mut self.is_sorted);
-        let field_names = std::mem::take(&mut self.field_names);
+        let field_names = &self.field_names;
 
         // Determine appropriate offset size based on the larger of dict size or total string size
         let max_offset = std::cmp::max(total_dict_size, nkeys);
@@ -235,7 +262,7 @@ impl WritableMetadataBuilder {
 
         // Write offsets
         let mut cur_offset = 0;
-        for key in &field_names {
+        for key in field_names {
             write_offset(metadata_buffer, cur_offset, offset_size);
             cur_offset += key.len();
         }
@@ -247,7 +274,8 @@ impl WritableMetadataBuilder {
             metadata_buffer.extend_from_slice(key.as_bytes());
         }
 
-        metadata_buffer.len()
+        self.field_names.clear();
+        self.metadata_buffer.len()
     }
 
     /// Returns the inner buffer, consuming self without finalizing any in progress metadata.
@@ -367,6 +395,63 @@ mod test {
         let field_names: Vec<Box<str>> = vec!["a".into(), "b".into(), "c".into()];
         let metadata = WritableMetadataBuilder::from_iter(field_names);
         assert_eq!(metadata.num_field_names(), 3);
+    }
+
+    /// Serializes one dictionary per key list through a single reused builder, returning each
+    /// dictionary's bytes and the field ids its upserts returned.
+    fn finish_each(dicts: &[&[&str]]) -> Vec<(Vec<u8>, Vec<u32>)> {
+        let mut builder = WritableMetadataBuilder::default();
+        let mut start = 0;
+        let mut out = Vec::new();
+        for keys in dicts {
+            let ids = keys.iter().map(|k| builder.upsert_field_name(k)).collect();
+            let end = builder.finish();
+            out.push((builder.metadata_buffer[start..end].to_vec(), ids));
+            start = end;
+        }
+        out
+    }
+
+    #[test]
+    fn test_metadata_builder_reuse_preserves_bytes() {
+        let long = "k".repeat(300);
+        let dicts: [&[&str]; 5] = [
+            &["b", "a", "b"],
+            &["a", "b", "a"],
+            &[long.as_str()],
+            &["z", "y", "x", "z"],
+            &[],
+        ];
+        let mut long_bytes = vec![0x51, 1, 0, 0, 0, 44, 1];
+        long_bytes.extend_from_slice(long.as_bytes());
+        let expected: [(Vec<u8>, Vec<u32>); 5] = [
+            (vec![0x01, 2, 0, 1, 2, b'b', b'a'], vec![0, 1, 0]),
+            (vec![0x11, 2, 0, 1, 2, b'a', b'b'], vec![0, 1, 0]),
+            (long_bytes, vec![0]),
+            (
+                vec![0x01, 3, 0, 1, 2, 3, b'z', b'y', b'x'],
+                vec![0, 1, 2, 0],
+            ),
+            (vec![0x01, 0, 0], vec![]),
+        ];
+
+        let reused = finish_each(&dicts);
+        assert_eq!(reused, expected);
+        // A builder reused across values encodes each exactly as a fresh builder does.
+        for (dict, reused) in dicts.iter().zip(&reused) {
+            assert_eq!(&finish_each(&[dict])[0], reused);
+        }
+    }
+
+    #[test]
+    fn test_metadata_builder_finish_retains_dictionary_capacity() {
+        let mut builder = WritableMetadataBuilder::default();
+        builder.extend(["c", "b", "a"]);
+        let capacity = builder.field_names.capacity();
+        builder.finish();
+        assert_eq!(builder.num_field_names(), 0);
+        assert!(!builder.is_sorted);
+        assert!(builder.field_names.capacity() >= capacity);
     }
 
     #[test]
