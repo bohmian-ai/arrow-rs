@@ -1887,6 +1887,26 @@ impl StreamEncoder {
         })
     }
 
+    /// Try to create a new stream encoder that writes through `ipc_write_context`, a context
+    /// returned by an earlier stream's [`Self::finish_with_context`].
+    ///
+    /// Only reusable encoder scratch carries over: the new stream starts with its own schema,
+    /// dictionary and end-of-stream state, so its bytes equal a stream encoded with a fresh
+    /// context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `schema` cannot be written as IPC.
+    pub fn try_new_with_context(
+        schema: &Schema,
+        write_options: IpcWriteOptions,
+        ipc_write_context: IpcWriteContext,
+    ) -> Result<Self, ArrowError> {
+        let mut encoder = Self::try_new_with_options(schema, write_options)?;
+        encoder.ipc_write_context = ipc_write_context;
+        Ok(encoder)
+    }
+
     /// Encode a [`RecordBatch`] into buffers.
     ///
     /// The first call also includes the IPC stream schema message before the
@@ -1918,6 +1938,24 @@ impl StreamEncoder {
     ///
     /// Returns an error if encoding the schema or end-of-stream marker fails.
     pub fn finish(mut self) -> Result<Vec<Buffer>, ArrowError> {
+        self.finish_stream()
+    }
+
+    /// Encode the end-of-stream marker, as [`Self::finish`] does, and return the encoder's
+    /// write context for the next independent stream's [`Self::try_new_with_context`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if encoding the schema or end-of-stream marker fails; the context is
+    /// dropped with the encoder.
+    pub fn finish_with_context(mut self) -> Result<(Vec<Buffer>, IpcWriteContext), ArrowError> {
+        let out = self.finish_stream()?;
+        let mut context = std::mem::take(&mut self.ipc_write_context);
+        context.release_metadata_builder();
+        Ok((out, context))
+    }
+
+    fn finish_stream(&mut self) -> Result<Vec<Buffer>, ArrowError> {
         let mut out = vec![];
         self.encode_schema(&mut out)?;
         let mut sink = Buffers { out: &mut out };
@@ -2880,6 +2918,132 @@ mod tests {
         let mut reader = StreamReader::try_new(Cursor::new(encoded), None).unwrap();
         assert_eq!(reader.next().unwrap().unwrap(), batch);
         assert!(reader.next().is_none());
+    }
+
+    /// Encodes `batches` as one stream through `context`, returning its bytes and the context.
+    #[cfg(feature = "zstd")]
+    fn encode_stream_with_context(
+        schema: &Schema,
+        batches: &[RecordBatch],
+        options: IpcWriteOptions,
+        context: IpcWriteContext,
+    ) -> (Vec<u8>, IpcWriteContext) {
+        let mut encoder = StreamEncoder::try_new_with_context(schema, options, context).unwrap();
+        let mut bytes = Vec::new();
+        for batch in batches {
+            for buffer in encoder.encode(batch).unwrap() {
+                bytes.extend_from_slice(buffer.as_slice());
+            }
+        }
+        let (tail, context) = encoder.finish_with_context().unwrap();
+        for buffer in tail {
+            bytes.extend_from_slice(buffer.as_slice());
+        }
+        (bytes, context)
+    }
+
+    // One context carried across independent compressed streams of different schemas and
+    // dictionaries keeps its compressor and still yields each stream's fresh-context bytes.
+    #[test]
+    #[cfg(feature = "zstd")]
+    fn test_stream_encoder_reused_context_matches_independent_streams() {
+        let options = IpcWriteOptions::default()
+            .try_with_compression(Some(crate::CompressionType::ZSTD))
+            .unwrap();
+        let dictionary_schema = Arc::new(Schema::new(vec![Field::new(
+            "a",
+            DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8)),
+            false,
+        )]));
+        let first = RecordBatch::try_new(
+            dictionary_schema.clone(),
+            vec![Arc::new(DictionaryArray::new(
+                UInt8Array::from_iter_values([0, 1, 0]),
+                Arc::new(StringArray::from_iter_values(["a", "b"])),
+            ))],
+        )
+        .unwrap();
+        let second = RecordBatch::try_new(
+            dictionary_schema.clone(),
+            vec![Arc::new(DictionaryArray::new(
+                UInt8Array::from_iter_values([1, 0]),
+                Arc::new(StringArray::from_iter_values(["c", "d"])),
+            ))],
+        )
+        .unwrap();
+        let plain = record_batch!(
+            ("x", Int64, [Some(1), None, Some(3)]),
+            ("y", Utf8, ["p", "q", "r"])
+        )
+        .unwrap();
+
+        let mut context = IpcWriteContext::default();
+        for (schema, batch) in [
+            (dictionary_schema.as_ref(), &first),
+            (plain.schema_ref().as_ref(), &plain),
+            (dictionary_schema.as_ref(), &second),
+        ] {
+            let (encoded, returned) = encode_stream_with_context(
+                schema,
+                std::slice::from_ref(batch),
+                options.clone(),
+                context,
+            );
+            context = returned;
+            assert_eq!(
+                encoded,
+                write_stream(schema, std::slice::from_ref(batch), options.clone())
+            );
+            assert!(
+                context.retained_bytes() > 0,
+                "the compressor was not retained"
+            );
+            let mut reader = StreamReader::try_new(Cursor::new(encoded), None).unwrap();
+            assert_eq!(&reader.next().unwrap().unwrap(), batch);
+            assert!(reader.next().is_none());
+        }
+    }
+
+    // A context reused under a different compression level compresses at the new level.
+    #[test]
+    #[cfg(feature = "zstd")]
+    fn test_stream_encoder_reused_context_follows_the_stream_level() {
+        let at = |level| {
+            IpcWriteOptions::default()
+                .try_with_compression(Some(crate::CompressionType::ZSTD))
+                .unwrap()
+                .try_with_compression_level(Some(level))
+                .unwrap()
+        };
+        let values: Vec<String> = (0..4096_u32)
+            .map(|row| format!("{:x}-{}", row.wrapping_mul(2_654_435_761) % 977, row % 13))
+            .collect();
+        let batch = RecordBatch::try_from_iter([(
+            "a",
+            Arc::new(StringArray::from_iter_values(values)) as ArrayRef,
+        )])
+        .unwrap();
+        assert_ne!(
+            write_stream(batch.schema_ref(), std::slice::from_ref(&batch), at(1)),
+            write_stream(batch.schema_ref(), std::slice::from_ref(&batch), at(19)),
+            "the levels must compress differently for this test to observe them"
+        );
+        let (_, context) = encode_stream_with_context(
+            batch.schema_ref(),
+            std::slice::from_ref(&batch),
+            at(1),
+            IpcWriteContext::default(),
+        );
+        let (encoded, _) = encode_stream_with_context(
+            batch.schema_ref(),
+            std::slice::from_ref(&batch),
+            at(19),
+            context,
+        );
+        assert_eq!(
+            encoded,
+            write_stream(batch.schema_ref(), std::slice::from_ref(&batch), at(19))
+        );
     }
 
     #[test]

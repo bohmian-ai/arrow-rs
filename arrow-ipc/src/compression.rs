@@ -34,8 +34,9 @@ pub struct IpcWriteContext {
     scratch: Vec<u8>,
     reserve_scratch: bool,
     fbb: FlatBufferBuilder<'static>,
+    /// The zstd compressor and the level it was created for.
     #[cfg(feature = "zstd")]
-    compressor: Option<zstd::bulk::Compressor<'static>>,
+    compressor: Option<(i32, zstd::bulk::Compressor<'static>)>,
 }
 
 impl IpcWriteContext {
@@ -57,15 +58,49 @@ impl IpcWriteContext {
             self.scratch.reserve(additional);
         }
     }
+    /// Returns the heap bytes this context retains for the next encode: the scratch buffer's
+    /// capacity and, with zstd, the compressor's current context size.
+    ///
+    /// The metadata [`FlatBufferBuilder`] does not report its capacity, so a context handed
+    /// back by [`crate::writer::StreamEncoder::finish_with_context`] has released it and this
+    /// count is complete for such a context.
+    pub fn retained_bytes(&mut self) -> usize {
+        #[cfg(feature = "zstd")]
+        let compressor = self
+            .compressor
+            .as_mut()
+            .map_or(0, |(_, compressor)| compressor.context_mut().sizeof());
+        #[cfg(not(feature = "zstd"))]
+        let compressor = 0;
+        self.scratch.capacity().saturating_add(compressor)
+    }
+
+    /// Replaces the metadata builder with an empty one, releasing its unmeasured allocation.
+    pub(crate) fn release_metadata_builder(&mut self) {
+        self.fbb = FlatBufferBuilder::new();
+    }
+
     pub(crate) fn scratch(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.scratch)
     }
 
     #[cfg(feature = "zstd")]
     fn zstd_compressor(&mut self, level: i32) -> &mut zstd::bulk::Compressor<'static> {
-        self.compressor.get_or_insert_with(|| {
-            zstd::bulk::Compressor::new(level).expect("can use default compression level")
-        })
+        // A context reused by another stream may carry a compressor for a different level.
+        if self
+            .compressor
+            .as_ref()
+            .is_some_and(|(created, _)| *created != level)
+        {
+            self.compressor = None;
+        }
+        let (_, compressor) = self.compressor.get_or_insert_with(|| {
+            (
+                level,
+                zstd::bulk::Compressor::new(level).expect("can use default compression level"),
+            )
+        });
+        compressor
     }
 }
 
