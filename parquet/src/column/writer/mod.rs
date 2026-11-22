@@ -1550,11 +1550,18 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
                         .flush_to(|data| buffer.extend_from_slice(data));
                 }
 
+                // Levels are small; reserve the values once instead of growing.
+                buffer.reserve_exact(values_data.buf.len());
                 buffer.extend_from_slice(&values_data.buf);
                 let uncompressed_size = buffer.len();
 
                 if let Some(ref mut cmpr) = self.compressor {
-                    let mut compressed_buf = Vec::with_capacity(uncompressed_size);
+                    // Allocate the codec's bound once so its reservation does
+                    // not regrow a buffer sized to the uncompressed page.
+                    let mut compressed_buf = Vec::with_capacity(
+                        cmpr.compress_bound(uncompressed_size)
+                            .unwrap_or(uncompressed_size),
+                    );
                     cmpr.compress(&buffer[..], &mut compressed_buf)?;
                     compressed_buf.shrink_to_fit();
                     buffer = compressed_buf;
@@ -1595,6 +1602,10 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
                 let is_compressed = match self.compressor {
                     Some(ref mut cmpr) => {
                         let buffer_len = buffer.len();
+                        buffer.reserve_exact(
+                            cmpr.compress_bound(values_data.buf.len())
+                                .unwrap_or(values_data.buf.len()),
+                        );
                         cmpr.compress(&values_data.buf, &mut buffer)?;
                         let compressed_values_size = buffer.len() - buffer_len;
                         let threshold = self.column_props.data_page_v2_compression_ratio_threshold;
@@ -1769,8 +1780,12 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
             let uncompressed_size = page.buf.len();
 
             if let Some(ref mut cmpr) = self.compressor {
-                let mut output_buf = Vec::with_capacity(uncompressed_size);
+                let mut output_buf = Vec::with_capacity(
+                    cmpr.compress_bound(uncompressed_size)
+                        .unwrap_or(uncompressed_size),
+                );
                 cmpr.compress(&page.buf, &mut output_buf)?;
+                output_buf.shrink_to_fit();
                 page.buf = Bytes::from(output_buf);
             }
 

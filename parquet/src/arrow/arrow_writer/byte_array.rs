@@ -33,6 +33,7 @@ use crate::schema::types::ColumnDescPtr;
 use crate::util::bit_util::num_required_bits;
 use crate::util::interner::{Interner, Storage};
 use crate::util::prefix::common_prefix_length;
+use arrow_array::cast::AsArray;
 use arrow_array::types::ByteArrayType;
 use arrow_array::{
     Array, ArrayAccessor, BinaryArray, BinaryViewArray, DictionaryArray, FixedSizeBinaryArray,
@@ -173,6 +174,26 @@ impl FallbackEncoder {
             num_values: 0,
             variable_length_bytes: 0,
         })
+    }
+
+    /// Reserves the exact bytes a Plain page needs for `indices` of an
+    /// offset-buffer byte array, so appending them grows the page buffer at
+    /// most once instead of doubling repeatedly.
+    ///
+    /// Only Plain encoding and offset arrays are sized: other encodings and
+    /// view or dictionary arrays keep growing as they append.
+    fn reserve_plain(&mut self, values: &dyn Array, indices: &[usize]) {
+        let FallbackEncoderImpl::Plain { buffer } = &mut self.encoder else {
+            return;
+        };
+        let bytes = match values.data_type() {
+            DataType::Utf8 => plain_gather_bytes(values.as_string::<i32>(), indices),
+            DataType::LargeUtf8 => plain_gather_bytes(values.as_string::<i64>(), indices),
+            DataType::Binary => plain_gather_bytes(values.as_binary::<i32>(), indices),
+            DataType::LargeBinary => plain_gather_bytes(values.as_binary::<i64>(), indices),
+            _ => return,
+        };
+        buffer.reserve(bytes);
     }
 
     /// Encode `values` to the in-progress page
@@ -478,6 +499,9 @@ impl ColumnValueEncoder for ByteArrayEncoder {
     }
 
     fn write_gather(&mut self, values: &Self::Values, indices: &[usize]) -> Result<()> {
+        if self.dict_encoder.is_none() {
+            self.fallback.reserve_plain(values, indices);
+        }
         downcast_op!(
             values.data_type(),
             values,
@@ -759,6 +783,16 @@ fn count_within_budget_views(
 ///
 /// `indices` are assumed sorted ascending — they always are here, since
 /// they come from `non_null_indices`, which is built in array order.
+/// Returns the exact Plain-encoded bytes of `indices` in `values`: each
+/// value's payload plus its 4-byte length prefix.
+fn plain_gather_bytes<T: ByteArrayType>(values: &GenericByteArray<T>, indices: &[usize]) -> usize {
+    let offsets = values.value_offsets();
+    indices
+        .iter()
+        .map(|&idx| (offsets[idx + 1] - offsets[idx]).as_usize() + std::mem::size_of::<u32>())
+        .sum()
+}
+
 fn count_within_budget_offsets<T: ByteArrayType>(
     values: &GenericByteArray<T>,
     indices: &[usize],

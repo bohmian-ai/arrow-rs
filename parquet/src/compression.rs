@@ -61,6 +61,16 @@ pub trait Codec: Send {
     /// across different `compress` calls.
     fn compress(&mut self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()>;
 
+    /// Returns the most bytes [`Self::compress`] may need to append for
+    /// `input_len` input bytes, when the codec knows that bound up front.
+    ///
+    /// A caller allocating a fresh output buffer sizes it to this bound so the
+    /// codec's own reservation never has to grow it. Codecs that stream into
+    /// the buffer return `None`.
+    fn compress_bound(&self, _input_len: usize) -> Option<usize> {
+        None
+    }
+
     /// Decompresses data stored in slice `input_buf` and appends output to `output_buf`.
     ///
     /// If the uncompress_size is provided it will allocate the exact amount of memory.
@@ -261,6 +271,10 @@ mod snappy_codec {
             self.decoder
                 .decompress(input_buf, &mut output_buf[offset..])
                 .map_err(|e| e.into())
+        }
+
+        fn compress_bound(&self, input_len: usize) -> Option<usize> {
+            Some(max_compress_len(input_len))
         }
 
         fn compress(&mut self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
@@ -581,6 +595,10 @@ mod zstd_codec {
             Ok(len)
         }
 
+        fn compress_bound(&self, input_len: usize) -> Option<usize> {
+            Some(zstd::zstd_safe::compress_bound(input_len))
+        }
+
         fn compress(&mut self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
             let offset = output_buf.len();
             let len = zstd::zstd_safe::compress_bound(input_buf.len());
@@ -668,6 +686,10 @@ mod lz4_raw_codec {
                 }
                 Err(e) => Err(ParquetError::External(Box::new(e))),
             }
+        }
+
+        fn compress_bound(&self, input_len: usize) -> Option<usize> {
+            Some(lz4_flex::block::get_maximum_output_size(input_len))
         }
 
         fn compress(&mut self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
@@ -862,6 +884,9 @@ mod tests {
         let mut decompressed = Vec::new();
         c1.compress(data, &mut compressed)
             .expect("Error when compressing");
+        if let Some(bound) = c1.compress_bound(data.len()) {
+            assert!(compressed.len() <= bound, "compress_bound must cover the output");
+        }
 
         // Decompress with c2
         let decompressed_size = c2
