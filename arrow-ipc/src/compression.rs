@@ -32,6 +32,10 @@ const DEFAULT_ZSTD_COMPRESSION_LEVEL: i32 = 3;
 #[derive(Default)]
 pub struct IpcWriteContext {
     scratch: Vec<u8>,
+    /// Reused output for compressing one body buffer. A codec reserves its
+    /// worst-case bound here once, and each encoded buffer copies out only
+    /// its compressed bytes.
+    compression_scratch: Vec<u8>,
     reserve_scratch: bool,
     fbb: FlatBufferBuilder<'static>,
     /// The zstd compressor and the level it was created for.
@@ -58,8 +62,9 @@ impl IpcWriteContext {
             self.scratch.reserve(additional);
         }
     }
-    /// Returns the heap bytes this context retains for the next encode: the scratch buffer's
-    /// capacity and, with zstd, the compressor's current context size.
+    /// Returns the heap bytes this context retains for the next encode: the scratch and
+    /// compression scratch buffers' capacity and, with zstd, the compressor's current
+    /// context size.
     ///
     /// The metadata [`FlatBufferBuilder`] does not report its capacity, so a context handed
     /// back by [`crate::writer::StreamEncoder::finish_with_context`] has released it and this
@@ -72,7 +77,26 @@ impl IpcWriteContext {
             .map_or(0, |(_, compressor)| compressor.context_mut().sizeof());
         #[cfg(not(feature = "zstd"))]
         let compressor = 0;
-        self.scratch.capacity().saturating_add(compressor)
+        self.scratch
+            .capacity()
+            .saturating_add(self.compression_scratch.capacity())
+            .saturating_add(compressor)
+    }
+
+    /// Compresses `input` with `codec` into the reused compression scratch and returns
+    /// an exact-length copy of the framed bytes, so no worst-case allocation outlives
+    /// the call.
+    pub(crate) fn compress_exact(
+        &mut self,
+        codec: CompressionCodec,
+        input: &[u8],
+    ) -> Result<Vec<u8>, ArrowError> {
+        let mut scratch = std::mem::take(&mut self.compression_scratch);
+        scratch.clear();
+        let result = codec.compress_to_vec(input, &mut scratch, self);
+        let encoded = result.map(|_| scratch.as_slice().to_vec());
+        self.compression_scratch = scratch;
+        encoded
     }
 
     /// Replaces the metadata builder with an empty one, releasing its unmeasured allocation.
@@ -465,6 +489,26 @@ mod tests {
             )
             .unwrap();
         assert_eq!(input_bytes, result.as_slice());
+    }
+
+    // Compressing through the context yields compress_to_vec's exact bytes in an
+    // exact-length buffer, and the context keeps (and reports) the reused scratch.
+    #[test]
+    #[cfg(feature = "zstd")]
+    fn test_compress_exact_matches_compress_to_vec_without_slack() {
+        let input: Vec<u8> = (0..4096_u32).flat_map(|i| (i % 17).to_le_bytes()).collect();
+        let codec = super::CompressionCodec::Zstd(super::DEFAULT_ZSTD_COMPRESSION_LEVEL);
+        let mut expected = Vec::new();
+        codec
+            .compress_to_vec(&input, &mut expected, &mut Default::default())
+            .unwrap();
+
+        let mut context = super::IpcWriteContext::default();
+        let encoded = context.compress_exact(codec, &input).unwrap();
+
+        assert_eq!(encoded, expected);
+        assert_eq!(encoded.capacity(), encoded.len());
+        assert!(context.retained_bytes() >= zstd::zstd_safe::compress_bound(input.len()));
     }
 
     #[test]

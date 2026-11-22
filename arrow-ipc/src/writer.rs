@@ -2710,12 +2710,10 @@ fn encode_sink_buffer(
             (EncodedBuffer::Raw(buffer), len)
         }
         Some(codec) => {
-            let mut scratch = Vec::new();
-            let written =
-                codec.compress_to_vec(buffer.as_slice(), &mut scratch, ipc_write_context)?;
-            let len = i64::try_from(written)
+            let compressed = ipc_write_context.compress_exact(codec, buffer.as_slice())?;
+            let len = i64::try_from(compressed.len())
                 .map_err(|e| ArrowError::InvalidArgumentError(format!("{e}")))?;
-            (EncodedBuffer::Compressed(scratch), len)
+            (EncodedBuffer::Compressed(compressed), len)
         }
     };
 
