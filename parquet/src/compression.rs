@@ -885,7 +885,10 @@ mod tests {
         c1.compress(data, &mut compressed)
             .expect("Error when compressing");
         if let Some(bound) = c1.compress_bound(data.len()) {
-            assert!(compressed.len() <= bound, "compress_bound must cover the output");
+            assert!(
+                compressed.len() <= bound,
+                "compress_bound must cover the output"
+            );
         }
 
         // Decompress with c2
