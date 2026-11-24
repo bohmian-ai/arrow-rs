@@ -72,7 +72,27 @@ DictTypeToAnotherDict NoOutBitmapIfInIsAllValid
 
 # C++ tests whose assertions are not cast outcomes, and the Rust test owning
 # the equivalent assertion.
-MAPPED_ELSEWHERE = {}
+MAPPED_ELSEWHERE = {
+    "SameTypeZeroCopy": "arrow-cast cast::tests::conversion_casts_reuse_buffers",
+    "NoOutBitmapIfInIsAllValid": "arrow-cast cast::tests::conversion_casts_reuse_buffers",
+    "CastDoesNotProvideDefaultOptions": (
+        "the signature of cast_with_conversion_options, which takes "
+        "&ConversionOptions, so no call can omit them"
+    ),
+}
+
+# C++ tests of behavior arrow-cast does not have, and why.
+EXTENSION_TYPES = (
+    "arrow-cast has no extension types: an Arrow extension type is field "
+    "metadata over its storage type, which DataType does not carry, so an "
+    "extension array casts as its storage type."
+)
+LIMITATIONS = {
+    "ExtensionTypeToIntDowncast": EXTENSION_TYPES,
+    "PrimitiveToExtension": EXTENSION_TYPES,
+    "ExtensionDictToExtension": EXTENSION_TYPES,
+    "IntToExtensionTypeDowncast": EXTENSION_TYPES,
+}
 
 UNSAFE = dict(
     allow_int_overflow=True,
@@ -1393,6 +1413,90 @@ def _():
     yield fails(src.slice(1, 3), pa.struct(fields))
 
 
+C_NUMERIC = [pa.uint8(), pa.int8(), pa.uint16(), pa.int16(), pa.uint32(), pa.int32(), pa.uint64(), pa.int64(), pa.float32(), pa.float64()]
+
+
+@cpp_test("IdentityCasts")
+def _():
+    # The zero copy assertions are `cast::tests::conversion_casts_reuse_buffers`.
+    identities = [(pa.null(), "[null, null, null]"), (pa.bool_(), "[false, true, null, false]")]
+    identities += [(type, "[1, 2, null, 4]") for type in C_NUMERIC]
+    identities += [(type, '["foo", "bar"]') for type in [pa.utf8(), pa.binary(), pa.string_view(), pa.binary_view(), pa.binary(3)]]
+    identities += [
+        (pa.list_(pa.int8()), "[[1, 2], [null], [], [3]]"),
+        (pa.time32("ms"), "[1, 2, 3, 4]"),
+        (pa.time64("us"), "[1, 2, 3, 4]"),
+        (pa.date32(), "[1, 2, 3, 4]"),
+        (pa.date64(), "[86400000, 0]"),
+        (pa.timestamp("s"), "[1, 2, 3, 4]"),
+        (pa.dictionary(pa.int8(), pa.int8()), "[1, 2, 3, 1, null, 3]"),
+    ]
+    for type, text in identities:
+        array = J(type, text)
+        yield check(array, array)
+
+
+@cpp_test("EmptyCasts")
+def _():
+    def empty(type):
+        # Python creates array with nullptr instead of 0-length (valid) buffers.
+        return pa.Array.from_buffers(type, 0, [None, None])
+
+    for numeric in C_NUMERIC:
+        yield check(empty(pa.bool_()), pa.array([], numeric))
+        yield check(empty(numeric), pa.array([], pa.bool_()))
+
+
+@cpp_test("CastWithNoValidityBitmapButUnknownNullCount")
+def _():
+    values = J(pa.bool_(), "[true, true, false]")
+    unknown = pa.Array.from_buffers(pa.bool_(), 3, values.buffers(), null_count=-1)
+    yield check(unknown, J(pa.int8(), "[1, 1, 0]"))
+
+
+@cpp_test("FromNull")
+def _():
+    for to_type in [pa.null()] + C_NUMERIC + [pa.date32(), pa.date64(), pa.binary(10), pa.binary(), pa.utf8()]:
+        yield check(pa.nulls(10), pa.nulls(10, to_type))
+
+
+@cpp_test("FromNullToDictionary")
+def _():
+    yield check(pa.nulls(10), pa.nulls(10, pa.dictionary(pa.int8(), pa.bool_())))
+
+
+@cpp_test("FromDictionary")
+def _():
+    dictionaries = [pa.nulls(5)]
+    dictionaries += [J(type, "[23, 12, 45, 12, null]") for type in C_NUMERIC]
+    dictionaries += [J(type, '["foo", "bar", "baz", "foo", null]') for type in BASE_BINARY]
+    for dictionary in dictionaries:
+        for index_type in INTEGER:
+            indices = J(index_type, "[4, 0, 1, 2, 0, 4, null, 2]")
+            yield check(pa.DictionaryArray.from_arrays(indices, dictionary), dictionary.take(indices))
+    for dictionary in dictionaries[1:]:
+        no_nulls = dictionary.take(J(pa.int8(), "[0, 0, 1, 2, 0, 3, 3, 2]"))
+        encoded = no_nulls.dictionary_encode()
+        assert encoded.buffers()[0] is None
+        yield check(encoded, no_nulls)
+
+
+@cpp_test("DictTypeToAnotherDict")
+def _():
+    for in_type, out_type, text in [
+        (pa.dictionary(pa.int8(), pa.int16()), pa.dictionary(pa.int8(), pa.int16()), "[1, 2, 3, 1, null, 3]"),
+        (pa.dictionary(pa.int8(), pa.int16()), pa.dictionary(pa.int32(), pa.int64()), "[1, 2, 3, 1, null, 3]"),
+        (pa.dictionary(pa.int8(), pa.int16()), pa.dictionary(pa.int32(), pa.float64()), "[1, 2, 3, 1, null, 3]"),
+        (pa.dictionary(pa.int32(), pa.utf8()), pa.dictionary(pa.int8(), pa.utf8()), '["a", "b", "a", null]'),
+    ]:
+        array = J(in_type, text)
+        yield check(array, array if in_type == out_type else J(out_type, text))
+    array = J(pa.dictionary(pa.int32(), pa.int32()), "[1, 1000]")
+    # The C++ test checks only that the unsafe cast succeeds with a valid result.
+    yield attempt(array, pa.dictionary(pa.int8(), pa.int8()), **UNSAFE)
+    yield fails(array, pa.dictionary(pa.int8(), pa.int8()))
+
+
 # One type of every Arrow C++ type id PyArrow can construct, in C++ id order.
 REGISTRATION_TYPES = [
     pa.null(), pa.bool_(), *INTEGER, pa.float16(), pa.float32(), pa.float64(),
@@ -1429,4 +1533,8 @@ def cases():
 
 def unmapped_tests():
     translated = {name for name, _ in _REGISTRY}
-    return [name for name in CPP_TESTS if name not in translated and name not in MAPPED_ELSEWHERE]
+    return [
+        name
+        for name in CPP_TESTS
+        if name not in translated and name not in MAPPED_ELSEWHERE and name not in LIMITATIONS
+    ]
