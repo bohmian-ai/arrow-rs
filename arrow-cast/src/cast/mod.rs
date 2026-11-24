@@ -2680,6 +2680,9 @@ fn cast_struct_to_struct(
     to_fields: Fields,
     cast_options: &CastContext,
 ) -> Result<ArrayRef, ArrowError> {
+    if cast_options.conversion.is_some() {
+        return conversion_struct_to_struct(array, &to_fields, cast_options);
+    }
     // Fast path: if field names are in the same order, we can just zip and cast
     let fields_match_order = from_fields.len() == to_fields.len()
         && from_fields
@@ -2708,6 +2711,71 @@ fn cast_struct_to_struct(
 
     let array = StructArray::try_new(to_fields.clone(), fields, array.nulls().cloned())?;
     Ok(Arc::new(array) as ArrayRef)
+}
+
+/// Casts `array` as Arrow C++ `CastStruct` does: each target field takes the
+/// first source field of its name that no earlier target field took, and a
+/// nullable target field without one is all null. The struct's validity is
+/// kept.
+///
+/// # Errors
+///
+/// [`ArrowError::SchemaError`], the Arrow C++ type error, for a non-nullable
+/// target field without a source field; [`ArrowError::CastError`] for a
+/// nullable source field holding nulls cast to a non-nullable one; and any
+/// error of casting a field.
+fn conversion_struct_to_struct(
+    array: &StructArray,
+    to_fields: &Fields,
+    cast_options: &CastContext,
+) -> Result<ArrayRef, ArrowError> {
+    let from_fields = array.fields();
+    let mut taken = vec![false; from_fields.len()];
+    let mut sources = Vec::with_capacity(to_fields.len());
+    for to_field in to_fields {
+        let source = (0..from_fields.len())
+            .find(|&index| !taken[index] && from_fields[index].name() == to_field.name());
+        match source {
+            Some(index) => taken[index] = true,
+            None if to_field.is_nullable() => {}
+            None => {
+                return Err(ArrowError::SchemaError(format!(
+                    "struct fields don't match: non-nullable out field `{}` not found in in fields {}",
+                    to_field.name(),
+                    array.data_type()
+                )));
+            }
+        }
+        sources.push(source);
+    }
+    let columns = sources
+        .into_iter()
+        .zip(to_fields)
+        .map(|(source, to_field)| {
+            let Some(index) = source else {
+                return Ok(new_null_array(to_field.data_type(), array.len()));
+            };
+            let from_field = &from_fields[index];
+            let values = array.column(index);
+            if from_field.is_nullable() && !to_field.is_nullable() && values.null_count() > 0 {
+                return Err(ArrowError::CastError(format!(
+                    "field '{}' of type {} has nulls. Can't cast to non-nullable field '{}' of type {}",
+                    from_field.name(),
+                    from_field.data_type(),
+                    to_field.name(),
+                    to_field.data_type()
+                )));
+            }
+            cast_with_context(values, to_field.data_type(), cast_options)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let array = StructArray::try_new_with_length(
+        to_fields.clone(),
+        columns,
+        array.nulls().cloned(),
+        array.len(),
+    )?;
+    Ok(Arc::new(array))
 }
 
 fn cast_struct_fields_by_name(

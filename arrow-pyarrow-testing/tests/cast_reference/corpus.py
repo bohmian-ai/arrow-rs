@@ -1288,6 +1288,111 @@ def _():
     yield type_error(J(src_type, nested), three)
 
 
+def S(arrays, names, valid=None):
+    """C++ `StructArray::Make(arrays, names, null_bitmap)`: the children are
+    unchanged and `valid` is the struct's own validity."""
+    mask = None if valid is None else pa.array([not v for v in valid])
+    if names and isinstance(names[0], pa.Field):
+        return pa.StructArray.from_arrays(arrays, fields=names, mask=mask)
+    return pa.StructArray.from_arrays(arrays, names=names, mask=mask)
+
+
+@cpp_test("StructToSameSizedAndNamedStruct")
+def _():
+    for src in NUMERIC:
+        for dest in NUMERIC:
+            a1, b1 = J(src, "[1, 2, 3, 4, null]"), J(src, "[null, 7, 8, 9, 0]")
+            a2, b2 = J(dest, "[1, 2, 3, 4, null]"), J(dest, "[null, 7, 8, 9, 0]")
+            yield check(S([a1, b1], ["a", "b"]), S([a2, b2], ["a", "b"]))
+            valid = [False, True, False, True, False]
+            yield check(S([a1, b1], ["a", "b"], valid), S([a2, b2], ["a", "b"], valid))
+
+
+def _struct_subset(b, d, e, valid=None):
+    """C++ `CheckStructToStructSubset` and, with `valid`,
+    `CheckStructToStructSubsetWithNulls`, whose third destination is
+    `{a, d, e}` rather than `{c, d, e}`."""
+    for src in NUMERIC:
+        for dest in NUMERIC:
+            values = ["[1, 2, 5]", b, "[9, 11, 44]", d, e]
+            a1, b1, c1, d1, e1 = (J(src, v) for v in values)
+            a2, b2, c2, d2, e2 = (J(dest, v) for v in values)
+            nulls = J(dest, "[null, null, null]")
+            source = S([a1, b1, c1, d1, e1], ["a", "b", "c", "d", "e"], valid)
+            third = (a2, "a") if valid else (c2, "c")
+            for arrays, names in [
+                ([a2], ["a"]),
+                ([b2, c2], ["b", "c"]),
+                ([third[0], d2, e2], [third[1], "d", "e"]),
+                ([a2, b2, c2, e2], ["a", "b", "c", "e"]),
+                ([a2, b2, c2, d2, e2], ["a", "b", "c", "d", "e"]),
+                ([a2, d2, nulls], ["a", "d", "f"]),
+                ([a2, c2, b2], ["a", "c", "b"]),
+                ([a2, c2, d2, nulls], ["a", "c", "d", "a"]),
+            ]:
+                yield check(source, S(arrays, names, valid))
+            yield type_error(source, pa.struct([pa.field("a", pa.int8()), pa.field("d", pa.int16()), pa.field("f", pa.int64(), False)]))
+            last = pa.int8() if valid else pa.int64()
+            fourth = pa.int64() if valid else pa.int32()
+            yield type_error(source, pa.struct([pa.field("a", pa.int8()), pa.field("c", pa.int16()), pa.field("d", fourth), pa.field("a", last, False)]))
+            duplicate = S([a1, b1, c1], ["a", "a", "a"], valid)
+            for arrays in [[a2], [a2, b2], [a2, b2, c2], [a2, b2, c2, nulls]]:
+                yield check(duplicate, S(arrays, ["a"] * len(arrays), valid))
+            yield type_error(duplicate, pa.struct([pa.field("a", pa.int8())] * 3 + [pa.field("a", pa.int8(), False)]))
+
+
+@cpp_test("StructToStructSubset")
+def _():
+    yield from _struct_subset("[3, 4, 7]", "[6, 51, 49]", "[19, 17, 74]")
+
+
+@cpp_test("StructToStructSubsetWithNulls")
+def _():
+    yield from _struct_subset("[3, null, 7]", "[6, 51, null]", "[null, 17, 74]", [False, True, False])
+
+
+@cpp_test("StructToSameSizedButDifferentNamedStruct")
+def _():
+    src = S([J(pa.int8(), "[1, 2]"), J(pa.int8(), "[3, 4]")], ["a", "b"])
+    nulls = J(pa.int8(), "[null, null]")
+    yield check(src, S([nulls, nulls], ["c", "d"]))
+    yield type_error(src, pa.struct([pa.field("c", pa.int8(), False), pa.field("d", pa.int8())]))
+
+
+@cpp_test("StructToBiggerStruct")
+def _():
+    src = S([J(pa.int8(), "[1, 2]"), J(pa.int8(), "[3, 4]")], ["a", "b"])
+    yield type_error(src, pa.struct([pa.field("a", pa.int8()), pa.field("b", pa.int8()), pa.field("c", pa.int8(), False)]))
+    yield type_error(src, pa.struct([pa.field("a", pa.int8()), pa.field("c", pa.int8(), False), pa.field("b", pa.int8())]))
+
+
+@cpp_test("StructToBiggerNullableStruct")
+def _():
+    a, b, c = J(pa.int8(), "[1, 2]"), J(pa.int8(), "[3, 4]"), J(pa.int8(), "[null, null]")
+    src = S([a, b], ["a", "b"])
+    yield check(src, S([a, b, c], ["a", "b", "c"]))
+    yield check(src, S([a, c, b], ["a", "c", "b"]))
+
+
+@cpp_test("StructToDifferentNullabilityStruct")
+def _():
+    values = ["[11, 23, 56]", "[32, 46, 37]", "[95, 11, 44]"]
+    src = S([J(pa.int8(), v) for v in values], [pa.field(n, pa.int8(), False) for n in "abc"])
+    fields = [pa.field(n, pa.int64(), True) for n in "abc"]
+    arrays = [J(pa.int64(), v) for v in values]
+    yield check(src, S(arrays, fields))
+    yield check(src, S([arrays[0], arrays[2]], [fields[0], fields[2]]))
+    yield check(src, S([arrays[1]], [fields[1]]))
+
+    src = S([J(pa.int8(), v) for v in ["[1, null, 5]", "[3, 4, null]", "[9, 11, 44]"]], [pa.field(n, pa.int8(), True) for n in "abc"])
+    fields = [pa.field(n, pa.int64(), False) for n in "abc"]
+    yield fails(src, pa.struct(fields))
+    yield fails(src, pa.struct([fields[0], fields[2]]))
+    yield check(src, S([J(pa.int64(), "[9, 11, 44]")], [fields[2]]))
+    yield check(src.slice(0, 1), S([J(pa.int64(), v) for v in ["[1]", "[3]", "[9]"]], fields))
+    yield fails(src.slice(1, 3), pa.struct(fields))
+
+
 # One type of every Arrow C++ type id PyArrow can construct, in C++ id order.
 REGISTRATION_TYPES = [
     pa.null(), pa.bool_(), *INTEGER, pa.float16(), pa.float32(), pa.float64(),
