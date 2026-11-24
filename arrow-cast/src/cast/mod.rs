@@ -1081,7 +1081,9 @@ pub(crate) fn cast_with_context(
         }
     }
     if let Some(conversion) = &cast_options.conversion {
-        if let Some(result) = conversion_temporal(array, to_type, conversion) {
+        if let Some(result) = conversion_temporal(array, to_type, conversion)
+            .or_else(|| conversion_format(array, to_type))
+        {
             return result;
         }
     }

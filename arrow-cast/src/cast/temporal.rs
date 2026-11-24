@@ -21,7 +21,7 @@ use crate::cast::*;
 use chrono::DateTime;
 
 /// Units of `unit` in one second.
-fn per_second(unit: &TimeUnit) -> i64 {
+pub(crate) fn per_second(unit: &TimeUnit) -> i64 {
     match unit {
         TimeUnit::Second => 1,
         TimeUnit::Millisecond => 1_000,
@@ -50,7 +50,7 @@ fn time_unit(data_type: &DataType) -> &TimeUnit {
 }
 
 /// `array` with its values read as `data_type`, sharing its buffers.
-fn retype(array: &dyn Array, data_type: DataType) -> Result<ArrayRef, ArrowError> {
+pub(crate) fn retype(array: &dyn Array, data_type: DataType) -> Result<ArrayRef, ArrowError> {
     Ok(make_array(
         array
             .to_data()
@@ -184,25 +184,12 @@ fn localized_timestamp(
     to_type: &DataType,
     conversion: &ConversionOptions,
 ) -> Result<ArrayRef, ArrowError> {
-    let tz = tz
-        .map(|tz| {
-            tz.parse::<Tz>().map_err(|error| {
-                ArrowError::CastError(format!("Cannot locate or parse timezone '{tz}': {error}"))
-            })
-        })
-        .transpose()?;
+    let tz = zone(tz)?;
     let per_second = per_second(unit);
     let per_day = per_second * 86_400;
     let local = move |v: i64| match &tz {
         None => v,
-        Some(tz) => {
-            let offset = DateTime::from_timestamp(v.div_euclid(per_second), 0).map_or(0, |utc| {
-                tz.offset_from_utc_datetime(&utc.naive_utc())
-                    .fix()
-                    .local_minus_utc()
-            });
-            v.wrapping_add(offset as i64 * per_second)
-        }
+        Some(tz) => v.wrapping_add(utc_offset(tz, v, per_second) as i64 * per_second),
     };
     let values = retype(array, DataType::Int64)?;
     let values = values.as_primitive::<Int64Type>();
@@ -238,4 +225,28 @@ fn localized_timestamp(
         _ => unreachable!("only called for date and time targets"),
     };
     retype(&result, to_type.clone())
+}
+
+/// The time zone named by a timestamp type, as Arrow C++ `LocateZone` finds it.
+///
+/// # Errors
+///
+/// Returns [`ArrowError::CastError`] for a name that is not a time zone.
+pub(crate) fn zone(tz: Option<&str>) -> Result<Option<Tz>, ArrowError> {
+    tz.map(|tz| {
+        tz.parse::<Tz>().map_err(|error| {
+            ArrowError::CastError(format!("Cannot locate or parse timezone '{tz}': {error}"))
+        })
+    })
+    .transpose()
+}
+
+/// The offset from UTC in seconds of `tz` at the instant `value`, counted in
+/// units of which `per_second` make a second.
+pub(crate) fn utc_offset(tz: &Tz, value: i64, per_second: i64) -> i32 {
+    DateTime::from_timestamp(value.div_euclid(per_second), 0).map_or(0, |utc| {
+        tz.offset_from_utc_datetime(&utc.naive_utc())
+            .fix()
+            .local_minus_utc()
+    })
 }

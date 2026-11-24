@@ -621,3 +621,306 @@ fn parse_cpp_integer<N: NumCast>(s: &[u8]) -> Option<N> {
 fn parse_cpp_float<F: std::str::FromStr>(s: &[u8]) -> Option<F> {
     std::str::from_utf8(s).ok()?.parse().ok()
 }
+
+/// Formats the values of `array` as the strings of `to_type` as Arrow C++
+/// `StringFormatter` and its zoned timestamp formatter do, or returns `None`
+/// when Arrow C++ does not format the input type this way.
+///
+/// # Errors
+///
+/// Returns [`ArrowError::CastError`] for a timestamp time zone that is not a
+/// time zone.
+pub(crate) fn conversion_format(
+    array: &dyn Array,
+    to_type: &DataType,
+) -> Option<Result<ArrayRef, ArrowError>> {
+    formatted(array, to_type).transpose()
+}
+
+fn formatted(array: &dyn Array, to_type: &DataType) -> Result<Option<ArrayRef>, ArrowError> {
+    use DataType::*;
+    use std::fmt::Write;
+    type Format<'a> = Box<dyn Fn(usize, &mut String) + 'a>;
+    fn integer<'a, T: ArrowPrimitiveType>(array: &'a dyn Array) -> Format<'a>
+    where
+        T::Native: std::fmt::Display,
+    {
+        let array = array.as_primitive::<T>();
+        Box::new(move |i, out| write!(out, "{}", array.value(i)).expect("writes to a String"))
+    }
+    fn decimal<'a, T: ArrowPrimitiveType>(array: &'a dyn Array, scale: i8) -> Format<'a>
+    where
+        T::Native: std::fmt::Display,
+    {
+        let array = array.as_primitive::<T>();
+        Box::new(move |i, out| {
+            write!(out, "{}", array.value(i)).expect("writes to a String");
+            adjust_integer_string_with_scale(scale as i32, out);
+        })
+    }
+    let format: Format = match array.data_type() {
+        Boolean => {
+            let array = array.as_boolean();
+            Box::new(move |i, out| out.push_str(if array.value(i) { "true" } else { "false" }))
+        }
+        Int8 => integer::<Int8Type>(array),
+        Int16 => integer::<Int16Type>(array),
+        Int32 => integer::<Int32Type>(array),
+        Int64 => integer::<Int64Type>(array),
+        UInt8 => integer::<UInt8Type>(array),
+        UInt16 => integer::<UInt16Type>(array),
+        UInt32 => integer::<UInt32Type>(array),
+        UInt64 => integer::<UInt64Type>(array),
+        Duration(_) => {
+            let value = wide_values(array)?;
+            Box::new(move |i, out| write!(out, "{}", value(i)).expect("writes to a String"))
+        }
+        Float16 => {
+            let array = array.as_primitive::<Float16Type>();
+            Box::new(move |i, out| {
+                let shortest = format!("{:e}", array.value(i).to_f32() as f64);
+                format_cpp_float(&shortest, out)
+            })
+        }
+        Float32 => {
+            let array = array.as_primitive::<Float32Type>();
+            Box::new(move |i, out| format_cpp_float(&format!("{:e}", array.value(i)), out))
+        }
+        Float64 => {
+            let array = array.as_primitive::<Float64Type>();
+            Box::new(move |i, out| format_cpp_float(&format!("{:e}", array.value(i)), out))
+        }
+        Decimal32(_, scale) => decimal::<Decimal32Type>(array, *scale),
+        Decimal64(_, scale) => decimal::<Decimal64Type>(array, *scale),
+        Decimal128(_, scale) => decimal::<Decimal128Type>(array, *scale),
+        Decimal256(_, scale) => decimal::<Decimal256Type>(array, *scale),
+        Date32 => {
+            let value = wide_values(array)?;
+            Box::new(move |i, out| {
+                let days = value(i);
+                if in_date_range(days, 1) {
+                    format_date(days, out)
+                } else {
+                    write!(out, "<value out of range: {days}>").expect("writes to a String")
+                }
+            })
+        }
+        Date64 => {
+            let value = wide_values(array)?;
+            Box::new(move |i, out| {
+                let millis = value(i);
+                if in_date_range(millis, 86_400_000) {
+                    // Arrow C++ truncates milliseconds to days towards zero.
+                    format_date(millis / 86_400_000, out)
+                } else {
+                    write!(out, "<value out of range: {millis}>").expect("writes to a String")
+                }
+            })
+        }
+        Time32(unit) | Time64(unit) => {
+            let per_second = per_second(unit);
+            let value = wide_values(array)?;
+            Box::new(move |i, out| {
+                let value = value(i);
+                if (0..86_400 * per_second).contains(&value) {
+                    format_time(value, per_second, out)
+                } else {
+                    write!(out, "<value out of range: {value}>").expect("writes to a String")
+                }
+            })
+        }
+        Timestamp(unit, tz) => {
+            let zone = zone(tz.as_deref())?;
+            let utc = tz.as_deref() == Some("UTC");
+            let per_second = per_second(unit);
+            let per_day = per_second * 86_400;
+            let value = wide_values(array)?;
+            let nanoseconds = matches!(unit, TimeUnit::Nanosecond);
+            Box::new(move |i, out| {
+                let value = value(i);
+                if !nanoseconds && !in_date_range(value, per_day) {
+                    write!(out, "<value out of range: {value}>").expect("writes to a String");
+                    return;
+                }
+                let offset = zone
+                    .as_ref()
+                    .map_or(0, |zone| utc_offset(zone, value, per_second));
+                let local = value.wrapping_add(offset as i64 * per_second);
+                format_date(local.div_euclid(per_day), out);
+                out.push(' ');
+                format_time(local.rem_euclid(per_day), per_second, out);
+                if utc {
+                    out.push('Z');
+                } else if zone.is_some() {
+                    let sign = if offset < 0 { '-' } else { '+' };
+                    let minutes = offset.abs() / 60;
+                    write!(out, "{sign}{:02}{:02}", minutes / 60, minutes % 60)
+                        .expect("writes to a String");
+                }
+            })
+        }
+        _ => return Ok(None),
+    };
+    let mut buffer = String::new();
+    let mut value = |i: usize| -> Option<String> {
+        array.is_valid(i).then(|| {
+            buffer.clear();
+            format(i, &mut buffer);
+            buffer.clone()
+        })
+    };
+    Ok(Some(match to_type {
+        Utf8 => Arc::new((0..array.len()).map(&mut value).collect::<StringArray>()),
+        LargeUtf8 => Arc::new(
+            (0..array.len())
+                .map(&mut value)
+                .collect::<LargeStringArray>(),
+        ),
+        Utf8View => Arc::new(
+            (0..array.len())
+                .map(&mut value)
+                .collect::<StringViewArray>(),
+        ),
+        _ => return Ok(None),
+    }))
+}
+
+/// The values of a temporal `array`, sign extended to `i64`.
+fn wide_values(array: &dyn Array) -> Result<Box<dyn Fn(usize) -> i64>, ArrowError> {
+    Ok(if array.data_type().primitive_width() == Some(4) {
+        let values = retype(array, DataType::Int32)?
+            .as_primitive::<Int32Type>()
+            .clone();
+        Box::new(move |i| values.value(i) as i64)
+    } else {
+        let values = retype(array, DataType::Int64)?
+            .as_primitive::<Int64Type>()
+            .clone();
+        Box::new(move |i| values.value(i))
+    })
+}
+
+/// Whether the instant `value`, counted in units of which `per_day` make a
+/// day, is within the years -32767 to 32767 Arrow C++ formats.
+fn in_date_range(value: i64, per_day: i64) -> bool {
+    (-12_687_428 * per_day as i128..11_248_738 * per_day as i128).contains(&(value as i128))
+}
+
+/// Appends the proleptic Gregorian date `days` after 1970-01-01 as Arrow C++
+/// `FormatYYYY_MM_DD` does: at least four year digits and a leading `-` for
+/// years before year zero.
+fn format_date(days: i64, out: &mut String) {
+    use chrono::Datelike;
+    use std::fmt::Write;
+    let date = chrono::NaiveDate::from_num_days_from_ce_opt((days + 719_163) as i32)
+        .expect("a date in the formatted range");
+    let year = date.year();
+    let sign = if year < 0 { "-" } else { "" };
+    write!(
+        out,
+        "{sign}{:04}-{:02}-{:02}",
+        year.abs(),
+        date.month(),
+        date.day()
+    )
+    .expect("writes to a String");
+}
+
+/// Appends the time of day `value`, counted in units of which `per_second`
+/// make a second, with one fractional digit per decimal digit of the unit.
+fn format_time(value: i64, per_second: i64, out: &mut String) {
+    use std::fmt::Write;
+    let seconds = value / per_second;
+    write!(
+        out,
+        "{:02}:{:02}:{:02}",
+        seconds / 3600,
+        seconds / 60 % 60,
+        seconds % 60
+    )
+    .expect("writes to a String");
+    if per_second > 1 {
+        let digits = per_second.ilog10() as usize;
+        write!(out, ".{:0digits$}", value % per_second).expect("writes to a String");
+    }
+}
+
+/// Appends the shortest round trip representation `scientific`, written by
+/// Rust as `{:e}`, as Arrow C++ formats floating point values: decimal
+/// notation for decimal exponents from -6 to 9, scientific notation with a
+/// signed exponent otherwise, and `inf`, `-inf` and `nan`.
+fn format_cpp_float(scientific: &str, out: &mut String) {
+    use std::fmt::Write;
+    if scientific.ends_with("inf") || scientific == "NaN" {
+        out.push_str(match scientific {
+            "NaN" => "nan",
+            "inf" => "inf",
+            _ => "-inf",
+        });
+        return;
+    }
+    let (mantissa, exponent) = scientific.split_once('e').expect("Rust writes an exponent");
+    let exponent: i32 = exponent.parse().expect("Rust writes an integer exponent");
+    let (negative, mantissa) = match mantissa.strip_prefix('-') {
+        Some(mantissa) => (true, mantissa),
+        None => (false, mantissa),
+    };
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    let length = digits.len() as i32;
+    if negative {
+        out.push('-');
+    }
+    if (-6..10).contains(&exponent) {
+        let point = exponent + 1;
+        if point <= 0 {
+            out.push_str("0.");
+            out.extend(std::iter::repeat_n('0', (-point) as usize));
+            out.push_str(&digits);
+        } else if point >= length {
+            out.push_str(&digits);
+            out.extend(std::iter::repeat_n('0', (point - length) as usize));
+        } else {
+            out.push_str(&digits[..point as usize]);
+            out.push('.');
+            out.push_str(&digits[point as usize..]);
+        }
+    } else {
+        out.push_str(&digits[..1]);
+        if length > 1 {
+            out.push('.');
+            out.push_str(&digits[1..]);
+        }
+        let sign = if exponent < 0 { '-' } else { '+' };
+        write!(out, "e{sign}{}", exponent.abs()).expect("writes to a String");
+    }
+}
+
+/// Arrow C++ `AdjustIntegerStringWithScale`: places the decimal point of the
+/// integer string `out` for `scale`, in scientific notation for a negative
+/// scale or an adjusted exponent below -6.
+fn adjust_integer_string_with_scale(scale: i32, out: &mut String) {
+    use std::fmt::Write;
+    if scale == 0 {
+        return;
+    }
+    let negative = out.starts_with('-') as usize;
+    let length = out.len() as i32;
+    let digits = length - negative as i32;
+    let adjusted_exponent = digits - 1 - scale;
+    if scale < 0 || adjusted_exponent < -6 {
+        if digits > 1 {
+            out.insert(1 + negative, '.');
+        }
+        out.push('E');
+        if adjusted_exponent >= 0 {
+            out.push('+');
+        }
+        write!(out, "{adjusted_exponent}").expect("writes to a String");
+    } else if digits > scale {
+        out.insert((length - scale) as usize, '.');
+    } else {
+        let zeros: String = std::iter::repeat_n('0', (scale - digits + 2) as usize).collect();
+        out.insert_str(negative, &zeros);
+        out.replace_range(negative + 1..negative + 2, ".");
+    }
+}
