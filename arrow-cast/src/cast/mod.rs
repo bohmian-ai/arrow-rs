@@ -8544,7 +8544,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cast_float_to_integer_without_fractional_truncation() {
+    fn test_conversion_cast_float_to_integer() {
         let errors = CastOptions {
             safe: false,
             ..Default::default()
@@ -8645,7 +8645,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cast_decimal_to_integer_without_fractional_truncation() {
+    fn test_conversion_cast_decimal_to_integer() {
         let errors = CastOptions {
             safe: false,
             ..Default::default()
@@ -13452,7 +13452,7 @@ mod tests {
         }
     }
     #[test]
-    fn test_cast_nested_float_to_integer_without_fractional_truncation() {
+    fn test_conversion_cast_nested_float_to_integer() {
         let errors = CastOptions {
             safe: false,
             ..Default::default()
