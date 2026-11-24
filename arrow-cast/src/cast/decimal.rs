@@ -1234,95 +1234,6 @@ where
     Ok(Arc::new(array))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    #[expect(deprecated)]
-    fn test_parse_string_to_decimal_native() {
-        assert_eq!(
-            parse_string_to_decimal_native::<Decimal128Type>("123.456", 2).unwrap(),
-            12346
-        );
-        // The value is checked against the maximum precision of the type, not
-        // against any target precision
-        assert_eq!(
-            parse_string_to_decimal_native::<Decimal128Type>(&"9".repeat(38), 0).unwrap(),
-            10_i128.pow(38) - 1
-        );
-        assert!(
-            parse_string_to_decimal_native::<Decimal128Type>(&i128::MAX.to_string(), 0).is_err()
-        );
-        assert_eq!(
-            parse_string_to_decimal_native::<Decimal128Type>("abc", 2)
-                .unwrap_err()
-                .to_string(),
-            "Invalid argument error: Invalid decimal format: \"abc\""
-        );
-        assert_eq!(
-            parse_string_to_decimal_native::<Decimal32Type>("1", 10)
-                .unwrap_err()
-                .to_string(),
-            "Invalid argument error: Cannot convert 1 to Decimal32: Overflow"
-        );
-    }
-
-    #[test]
-    fn test_rescale_decimal_upscale_within_precision() {
-        let result = rescale_decimal::<Decimal128Type, Decimal128Type>(
-            12_345_i128, // 123.45 with scale 2
-            5,
-            2,
-            8,
-            5,
-        );
-        assert_eq!(result, Some(12_345_000_i128));
-    }
-
-    #[test]
-    fn test_rescale_decimal_downscale_rounds_half_away_from_zero() {
-        let positive = rescale_decimal::<Decimal128Type, Decimal128Type>(
-            1_050_i128, // 1.050 with scale 3
-            5, 3, 5, 1,
-        );
-        assert_eq!(positive, Some(11_i128)); // 1.1 with scale 1
-
-        let negative = rescale_decimal::<Decimal128Type, Decimal128Type>(
-            -1_050_i128, // -1.050 with scale 3
-            5,
-            3,
-            5,
-            1,
-        );
-        assert_eq!(negative, Some(-11_i128)); // -1.1 with scale 1
-    }
-
-    #[test]
-    fn test_rescale_decimal_downscale_large_delta_returns_zero() {
-        let result = rescale_decimal::<Decimal32Type, Decimal32Type>(12_345_i32, 9, 9, 9, 4);
-        assert_eq!(result, Some(0_i32));
-    }
-
-    #[test]
-    fn test_rescale_decimal_upscale_overflow_returns_none() {
-        let result = rescale_decimal::<Decimal32Type, Decimal32Type>(9_999_i32, 4, 0, 5, 2);
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_rescale_decimal_invalid_input_precision_scale_returns_none() {
-        let result = rescale_decimal::<Decimal128Type, Decimal128Type>(123_i128, 39, 39, 38, 38);
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_rescale_decimal_invalid_output_precision_scale_returns_none() {
-        let result = rescale_decimal::<Decimal128Type, Decimal128Type>(123_i128, 38, 38, 39, 39);
-        assert_eq!(result, None);
-    }
-}
-
 /// A floating point type Arrow C++ converts to decimals with `FromReal`.
 pub(crate) trait CppReal:
     ArrowNativeType + PartialOrd + std::ops::Mul<Output = Self> + std::ops::Neg<Output = Self>
@@ -1537,4 +1448,93 @@ where
         })?
         .with_precision_and_scale(precision, scale)
         .map(|array| Arc::new(array) as ArrayRef)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[expect(deprecated)]
+    fn test_parse_string_to_decimal_native() {
+        assert_eq!(
+            parse_string_to_decimal_native::<Decimal128Type>("123.456", 2).unwrap(),
+            12346
+        );
+        // The value is checked against the maximum precision of the type, not
+        // against any target precision
+        assert_eq!(
+            parse_string_to_decimal_native::<Decimal128Type>(&"9".repeat(38), 0).unwrap(),
+            10_i128.pow(38) - 1
+        );
+        assert!(
+            parse_string_to_decimal_native::<Decimal128Type>(&i128::MAX.to_string(), 0).is_err()
+        );
+        assert_eq!(
+            parse_string_to_decimal_native::<Decimal128Type>("abc", 2)
+                .unwrap_err()
+                .to_string(),
+            "Invalid argument error: Invalid decimal format: \"abc\""
+        );
+        assert_eq!(
+            parse_string_to_decimal_native::<Decimal32Type>("1", 10)
+                .unwrap_err()
+                .to_string(),
+            "Invalid argument error: Cannot convert 1 to Decimal32: Overflow"
+        );
+    }
+
+    #[test]
+    fn test_rescale_decimal_upscale_within_precision() {
+        let result = rescale_decimal::<Decimal128Type, Decimal128Type>(
+            12_345_i128, // 123.45 with scale 2
+            5,
+            2,
+            8,
+            5,
+        );
+        assert_eq!(result, Some(12_345_000_i128));
+    }
+
+    #[test]
+    fn test_rescale_decimal_downscale_rounds_half_away_from_zero() {
+        let positive = rescale_decimal::<Decimal128Type, Decimal128Type>(
+            1_050_i128, // 1.050 with scale 3
+            5, 3, 5, 1,
+        );
+        assert_eq!(positive, Some(11_i128)); // 1.1 with scale 1
+
+        let negative = rescale_decimal::<Decimal128Type, Decimal128Type>(
+            -1_050_i128, // -1.050 with scale 3
+            5,
+            3,
+            5,
+            1,
+        );
+        assert_eq!(negative, Some(-11_i128)); // -1.1 with scale 1
+    }
+
+    #[test]
+    fn test_rescale_decimal_downscale_large_delta_returns_zero() {
+        let result = rescale_decimal::<Decimal32Type, Decimal32Type>(12_345_i32, 9, 9, 9, 4);
+        assert_eq!(result, Some(0_i32));
+    }
+
+    #[test]
+    fn test_rescale_decimal_upscale_overflow_returns_none() {
+        let result = rescale_decimal::<Decimal32Type, Decimal32Type>(9_999_i32, 4, 0, 5, 2);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_rescale_decimal_invalid_input_precision_scale_returns_none() {
+        let result = rescale_decimal::<Decimal128Type, Decimal128Type>(123_i128, 39, 39, 38, 38);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_rescale_decimal_invalid_output_precision_scale_returns_none() {
+        let result = rescale_decimal::<Decimal128Type, Decimal128Type>(123_i128, 38, 38, 39, 39);
+        assert_eq!(result, None);
+    }
 }

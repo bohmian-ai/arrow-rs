@@ -666,14 +666,14 @@ fn formatted(array: &dyn Array, to_type: &DataType) -> Result<Option<ArrayRef>, 
     use DataType::*;
     use std::fmt::Write;
     type Format<'a> = Box<dyn Fn(usize, &mut String) + 'a>;
-    fn integer<'a, T: ArrowPrimitiveType>(array: &'a dyn Array) -> Format<'a>
+    fn integer<T: ArrowPrimitiveType>(array: &dyn Array) -> Format<'_>
     where
         T::Native: std::fmt::Display,
     {
         let array = array.as_primitive::<T>();
         Box::new(move |i, out| write!(out, "{}", array.value(i)).expect("writes to a String"))
     }
-    fn decimal<'a, T: ArrowPrimitiveType>(array: &'a dyn Array, scale: i8) -> Format<'a>
+    fn decimal<T: ArrowPrimitiveType>(array: &dyn Array, scale: i8) -> Format<'_>
     where
         T::Native: std::fmt::Display,
     {

@@ -1080,12 +1080,11 @@ pub(crate) fn cast_with_context(
             return Ok(new_empty_array(to_type));
         }
     }
-    if let Some(conversion) = &cast_options.conversion {
-        if let Some(result) = conversion_temporal(array, to_type, conversion)
+    if let Some(conversion) = &cast_options.conversion
+        && let Some(result) = conversion_temporal(array, to_type, conversion)
             .or_else(|| conversion_format(array, to_type))
-        {
-            return result;
-        }
+    {
+        return result;
     }
     match (from_type, to_type) {
         (Null, _) => Ok(new_null_array(to_type, array.len())),
@@ -3038,7 +3037,8 @@ where
     T::Native: NumCast + AsPrimitive<R::Native>,
     R::Native: NumCast,
 {
-    let check: Option<Box<dyn Fn(T::Native, R::Native) -> Result<(), ArrowError>>> =
+    type Check<T, R> = Option<Box<dyn Fn(T, R) -> Result<(), ArrowError>>>;
+    let check: Check<T::Native, R::Native> =
         match (T::DATA_TYPE.is_integer(), R::DATA_TYPE.is_integer()) {
             (true, true) if !conversion.allow_int_overflow => {
                 Some(Box::new(|value: T::Native, _| {
@@ -3091,7 +3091,7 @@ where
     };
     Ok(Arc::new(from.try_unary::<_, R, _>(|value| {
         let out = value.as_();
-        check(value, out).map(|_| out)
+        check(value, out).map(|()| out)
     })?))
 }
 
