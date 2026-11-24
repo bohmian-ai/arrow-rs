@@ -152,7 +152,8 @@ def J(type, text):
     """C++ `ArrayFromJSON(type, text)`."""
     values = json.loads(text) if isinstance(text, str) else text
     if pa.types.is_timestamp(type) and any(isinstance(v, str) for v in values):
-        return pa.array(values, pa.string()).cast(type)
+        # C++ reads timestamp strings as UTC instants whatever the zone.
+        return pa.array(values, pa.string()).cast(pa.timestamp(type.unit)).view(type)
     if pa.types.is_dictionary(type):
         return pa.array([_value(type.value_type, v) for v in values], type.value_type).dictionary_encode().cast(type)
     return pa.array([_value(type, v) for v in values], type)
@@ -586,6 +587,311 @@ def _():
     for string_type in [pa.utf8(), pa.string_view(), pa.large_utf8()]:
         for decimal_type in DECIMALS_5_2:
             yield check(J(decimal_type, '["0.00", null, "123.45", "999.99"]'), J(string_type, '["0.00", null, "123.45", "999.99"]'))
+
+
+def _coarse_and_fine(make, pairs):
+    """The C++ unit promotion and truncation loops shared by the timestamp,
+    time and duration tests: `pairs` of `(coarse, fine, promoted, truncated)`."""
+    for coarse, fine, promoted, truncated in pairs:
+        coarse_values = J(coarse, "[0, null, 200, 1, 2]")
+        yield check(coarse_values, J(fine, promoted))
+        yield fails(J(fine, truncated), coarse)
+        yield check(J(fine, truncated), coarse_values, allow_time_truncate=True)
+
+
+@cpp_test("TimestampToTimestamp")
+def _():
+    ts = pa.timestamp
+    yield from _coarse_and_fine(ts, [
+        (ts("s"), ts("ms"), "[0, null, 200000, 1000, 2000]", "[0, null, 200456, 1123, 2456]"),
+        (ts("ms"), ts("us"), "[0, null, 200000, 1000, 2000]", "[0, null, 200456, 1123, 2456]"),
+        (ts("us"), ts("ns"), "[0, null, 200000, 1000, 2000]", "[0, null, 200456, 1123, 2456]"),
+    ])
+    yield check(J(ts("s", "UTC"), "[0, null, 200, 1, 2]"), J(ts("s"), "[0, null, 200, 1, 2]"))
+    yield from _coarse_and_fine(ts, [
+        (ts("s"), ts("us"), "[0, null, 200000000, 1000000, 2000000]", "[0, null, 200456000, 1123000, 2456000]"),
+        (ts("ms"), ts("ns"), "[0, null, 200000000, 1000000, 2000000]", "[0, null, 200456000, 1123000, 2456000]"),
+    ])
+    yield from _coarse_and_fine(ts, [
+        (ts("s"), ts("ns"), "[0, null, 200000000000, 1000000000, 2000000000]", "[0, null, 200456000000, 1123000000, 2456000000]"),
+    ])
+
+
+@cpp_test("TimestampZeroCopy")
+def _():
+    # The zero copy assertion is `cast::tests::conversion_casts_reuse_buffers`.
+    values = "[0, null, 2000, 1000, 0]"
+    yield check(J(pa.timestamp("s"), values), J(pa.timestamp("s"), values))
+    yield check(J(pa.timestamp("s"), values), J(pa.int64(), values))
+    yield check(J(pa.int64(), values), J(pa.timestamp("s"), values))
+    yield check(J(pa.timestamp("s", "UTC"), values), J(pa.timestamp("s"), values))
+
+
+@cpp_test("TimestampToTimestampMultiplyOverflow")
+def _():
+    yield fails(J(pa.timestamp("s"), "[-30610224000, -5364662400, 946684800, 10413792000, 32503680000]"), pa.timestamp("ns"))
+
+
+TIMESTAMP_JSON = [
+    "1970-01-01T00:00:59.123456789", "2000-02-29T23:23:23.999999999",
+    "1899-01-01T00:59:20.001001001", "2033-05-18T03:33:20.000000000",
+    "2020-01-01T01:05:05.001", "2019-12-31T02:10:10.002",
+    "2019-12-30T03:15:15.003", "2009-12-31T04:20:20.004132",
+    "2010-01-01T05:25:25.005321", "2010-01-03T06:30:30.006163",
+    "2010-01-04T07:35:35", "2006-01-01T08:40:40", "2005-12-31T09:45:45",
+    "2008-12-28", "2008-12-29", "2012-01-01 01:02:03", None,
+]
+TIMESTAMP_SECONDS_JSON = [
+    "1970-01-01T00:00:59", "2000-02-29T23:23:23",
+    "1899-01-01T00:59:20", "2033-05-18T03:33:20",
+    "2020-01-01T01:05:05", "2019-12-31T02:10:10",
+    "2019-12-30T03:15:15", "2009-12-31T04:20:20",
+    "2010-01-01T05:25:25", "2010-01-03T06:30:30",
+    "2010-01-04T07:35:35", "2006-01-01T08:40:40",
+    "2005-12-31T09:45:45", "2008-12-28", "2008-12-29",
+    "2012-01-01 01:02:03", None,
+]
+TIMESTAMP_EXTREME_JSON = ["1677-09-20T00:00:59.123456", "2262-04-13T23:23:23.999999"]
+UNITS = ["s", "ms", "us", "ns"]
+
+
+@cpp_test("TimestampToDate")
+def _():
+    timestamps = J(pa.timestamp("ns"), TIMESTAMP_JSON)
+    date_32 = J(pa.date32(), "[0, 11016, -25932, 23148, 18262, 18261, 18260, 14609, 14610, 14612, 14613, 13149, 13148, 14241, 14242, 15340, null]")
+    date_64 = J(pa.date64(), "[0, 951782400000, -2240524800000, 1999987200000, 1577836800000, 1577750400000, 1577664000000, 1262217600000, 1262304000000, 1262476800000, 1262563200000, 1136073600000, 1135987200000, 1230422400000, 1230508800000, 1325376000000, null]")
+    extreme = J(pa.timestamp("us"), TIMESTAMP_EXTREME_JSON)
+    yield check(timestamps, date_32)
+    yield check(timestamps, date_64)
+    yield check(extreme, J(pa.date32(), "[-106753, 106753]"))
+    yield check(extreme, J(pa.date64(), "[-9223459200000, 9223459200000]"))
+    for unit in UNITS:
+        yield check(J(pa.timestamp(unit), TIMESTAMP_SECONDS_JSON), date_32)
+        yield check(J(pa.timestamp(unit), TIMESTAMP_SECONDS_JSON), date_64)
+
+
+@cpp_test("ZonedTimestampToDate")
+def _():
+    timestamps = J(pa.timestamp("ns", "Pacific/Marquesas"), TIMESTAMP_JSON)
+    yield check(timestamps, J(pa.date32(), "[-1, 11016, -25933, 23147, 18261, 18260, 18259, 14608, 14609, 14611, 14612, 13148, 13148, 14240, 14241, 15339, null]"))
+    yield check(timestamps, J(pa.date64(), "[-86400000, 951782400000, -2240611200000, 1999900800000, 1577750400000, 1577664000000, 1577577600000, 1262131200000, 1262217600000, 1262390400000, 1262476800000, 1135987200000, 1135987200000, 1230336000000, 1230422400000, 1325289600000, null]"))
+    date_32 = J(pa.date32(), "[0, 11017, -25932, 23148, 18262, 18261, 18260, 14609, 14610, 14612, 14613, 13149, 13148, 14241, 14242, 15340, null]")
+    date_64 = J(pa.date64(), "[0, 951868800000, -2240524800000, 1999987200000, 1577836800000, 1577750400000, 1577664000000, 1262217600000, 1262304000000, 1262476800000, 1262563200000, 1136073600000, 1135987200000, 1230422400000, 1230508800000, 1325376000000, null]")
+    for unit in UNITS:
+        timestamps = J(pa.timestamp(unit, "Australia/Broken_Hill"), TIMESTAMP_SECONDS_JSON)
+        yield check(timestamps, date_32)
+        yield check(timestamps, date_64)
+    for unit in UNITS:
+        timestamps = J(pa.timestamp(unit, "Mars/Mariner_Valley"), TIMESTAMP_SECONDS_JSON)
+        yield fails(timestamps, pa.date32(), **UNSAFE)
+        yield fails(timestamps, pa.date64(), **UNSAFE)
+
+
+@cpp_test("TimestampToTime")
+def _():
+    t32, t64, ts = pa.time32, pa.time64, pa.timestamp
+    timestamps = J(ts("ns"), TIMESTAMP_JSON)
+    extreme = J(ts("us"), TIMESTAMP_EXTREME_JSON)
+    timestamps_us = J(ts("us"), [
+        "1970-01-01T00:00:59.123456", "2000-02-29T23:23:23.999999",
+        "1899-01-01T00:59:20.001001", "2033-05-18T03:33:20.000000",
+        "2020-01-01T01:05:05.001", "2019-12-31T02:10:10.002",
+        "2019-12-30T03:15:15.003", "2009-12-31T04:20:20.004132",
+        "2010-01-01T05:25:25.005321", "2010-01-03T06:30:30.006163",
+        "2010-01-04T07:35:35", "2006-01-01T08:40:40", "2005-12-31T09:45:45",
+        "2008-12-28", "2008-12-29", "2012-01-01 01:02:03", None])
+    timestamps_ms = J(ts("ms"), [
+        "1970-01-01T00:00:59.123", "2000-02-29T23:23:23.999",
+        "1899-01-01T00:59:20.001", "2033-05-18T03:33:20.000",
+        "2020-01-01T01:05:05.001", "2019-12-31T02:10:10.002",
+        "2019-12-30T03:15:15.003", "2009-12-31T04:20:20.004",
+        "2010-01-01T05:25:25.005", "2010-01-03T06:30:30.006",
+        "2010-01-04T07:35:35", "2006-01-01T08:40:40", "2005-12-31T09:45:45",
+        "2008-12-28", "2008-12-29", "2012-01-01 01:02:03", None])
+    timestamps_s = J(ts("s"), TIMESTAMP_SECONDS_JSON)
+    times = J(t64("ns"), "[59123456789, 84203999999999, 3560001001001, 12800000000000, 3905001000000, 7810002000000, 11715003000000, 15620004132000, 19525005321000, 23430006163000, 27335000000000, 31240000000000, 35145000000000, 0, 0, 3723000000000, null]")
+    times_ns_us = J(t64("us"), "[59123456, 84203999999, 3560001001, 12800000000, 3905001000, 7810002000, 11715003000, 15620004132, 19525005321, 23430006163, 27335000000, 31240000000, 35145000000, 0, 0, 3723000000, null]")
+    times_ns_ms = J(t32("ms"), "[59123, 84203999, 3560001, 12800000, 3905001, 7810002, 11715003, 15620004, 19525005, 23430006, 27335000, 31240000, 35145000, 0, 0, 3723000, null]")
+    times_us_ns = J(t64("ns"), "[59123456000, 84203999999000, 3560001001000, 12800000000000, 3905001000000, 7810002000000, 11715003000000, 15620004132000, 19525005321000, 23430006163000, 27335000000000, 31240000000000, 35145000000000, 0, 0, 3723000000000, null]")
+    times_ms_ns = J(t64("ns"), "[59123000000, 84203999000000, 3560001000000, 12800000000000, 3905001000000, 7810002000000, 11715003000000, 15620004000000, 19525005000000, 23430006000000, 27335000000000, 31240000000000, 35145000000000, 0, 0, 3723000000000, null]")
+    times_ms_us = J(t64("us"), "[59123000, 84203999000, 3560001000, 12800000000, 3905001000, 7810002000, 11715003000, 15620004000, 19525005000, 23430006000, 27335000000, 31240000000, 35145000000, 0, 0, 3723000000, null]")
+    times_extreme = J(t64("us"), "[59123456, 84203999999]")
+    times_s = J(t32("s"), "[59, 84203, 3560, 12800, 3905, 7810, 11715, 15620, 19525, 23430, 27335, 31240, 35145, 0, 0, 3723, null]")
+    times_ms = J(t32("ms"), "[59000, 84203000, 3560000, 12800000, 3905000, 7810000, 11715000, 15620000, 19525000, 23430000, 27335000, 31240000, 35145000, 0, 0, 3723000, null]")
+    times_us = J(t64("us"), "[59000000, 84203000000, 3560000000, 12800000000, 3905000000, 7810000000, 11715000000, 15620000000, 19525000000, 23430000000, 27335000000, 31240000000, 35145000000, 0, 0, 3723000000, null]")
+    times_ns = J(t64("ns"), "[59000000000, 84203000000000, 3560000000000, 12800000000000, 3905000000000, 7810000000000, 11715000000000, 15620000000000, 19525000000000, 23430000000000, 27335000000000, 31240000000000, 35145000000000, 0, 0, 3723000000000, null]")
+
+    yield check(timestamps, times)
+    yield fails(timestamps, t64("us"))
+    yield check(extreme, times_extreme)
+    yield check(J(ts("s"), TIMESTAMP_SECONDS_JSON), times_s)
+    yield check(J(ts("s"), TIMESTAMP_SECONDS_JSON), times_ms)
+    yield check(J(ts("ms"), TIMESTAMP_SECONDS_JSON), times_s)
+    yield check(J(ts("ms"), TIMESTAMP_SECONDS_JSON), times_ms)
+    for unit, expected in [("us", times_us), ("us", times_ns), ("us", times_ms), ("us", times_s), ("ns", times_ns), ("ns", times_us), ("ns", times_ms), ("ns", times_s)]:
+        yield check(J(ts(unit), TIMESTAMP_SECONDS_JSON), expected)
+
+    yield fails(timestamps, t64("us"))
+    yield fails(timestamps, t32("ms"))
+    yield fails(timestamps, t32("s"))
+    yield fails(timestamps_us, t32("ms"))
+    yield fails(timestamps_us, t32("s"))
+    yield fails(timestamps_ms, t32("s"))
+    yield check(timestamps, times_ns_us, allow_time_truncate=True)
+    yield check(timestamps, times_ns_ms, allow_time_truncate=True)
+    yield check(timestamps, times_s, allow_time_truncate=True)
+    yield check(timestamps_us, times_ns_ms, allow_time_truncate=True)
+    yield check(timestamps_us, times_s, allow_time_truncate=True)
+    yield check(timestamps_ms, times_s, allow_time_truncate=True)
+
+    yield check(timestamps_us, times_us_ns)
+    yield check(timestamps_ms, times_ms_ns)
+    yield check(timestamps_ms, times_ms_us)
+    yield check(timestamps_s, times_ns)
+    yield check(timestamps_s, times_us)
+    yield check(timestamps_s, times_ms)
+
+    for unit in UNITS:
+        timestamps = J(ts(unit, "Mars/Mariner_Valley"), TIMESTAMP_SECONDS_JSON)
+        yield fails(timestamps, t32(unit) if unit in ("s", "ms") else t64(unit), **UNSAFE)
+
+
+@cpp_test("ZonedTimestampToTime")
+def _():
+    yield check(
+        J(pa.timestamp("ns", "Pacific/Marquesas"), TIMESTAMP_JSON),
+        J(pa.time64("ns"), "[52259123456789, 50003999999999, 56480001001001, 65000000000000, 56105001000000, 60010002000000, 63915003000000, 67820004132000, 71725005321000, 75630006163000, 79535000000000, 83440000000000, 945000000000, 52200000000000, 52200000000000, 55923000000000, null]"),
+    )
+    seconds = [34259, 35603, 35960, 47000, 41705, 45610, 49515, 53420, 57325, 61230, 65135, 69040, 72945, 37800, 37800, 41523]
+    for unit, type, factor in [("s", pa.time32("s"), 1), ("ms", pa.time32("ms"), 1000), ("us", pa.time64("us"), 10**6), ("ns", pa.time64("ns"), 10**9)]:
+        yield check(
+            J(pa.timestamp(unit, "Australia/Broken_Hill"), TIMESTAMP_SECONDS_JSON),
+            J(type, [v * factor for v in seconds] + [None]),
+        )
+
+
+@cpp_test("TimeToTime")
+def _():
+    t32, t64 = pa.time32, pa.time64
+    yield from _coarse_and_fine(None, [
+        (t32("s"), t32("ms"), "[0, null, 200000, 1000, 2000]", "[0, null, 200456, 1123, 2456]"),
+        (t32("ms"), t64("us"), "[0, null, 200000, 1000, 2000]", "[0, null, 200456, 1123, 2456]"),
+        (t64("us"), t64("ns"), "[0, null, 200000, 1000, 2000]", "[0, null, 200456, 1123, 2456]"),
+        (t32("s"), t64("us"), "[0, null, 200000000, 1000000, 2000000]", "[0, null, 200456000, 1123000, 2456000]"),
+        (t32("ms"), t64("ns"), "[0, null, 200000000, 1000000, 2000000]", "[0, null, 200456000, 1123000, 2456000]"),
+        (t32("s"), t64("ns"), "[0, null, 200000000000, 1000000000, 2000000000]", "[0, null, 200456000000, 1123000000, 2456000000]"),
+    ])
+
+
+@cpp_test("TimeZeroCopy")
+def _():
+    # The zero copy assertion is `cast::tests::conversion_casts_reuse_buffers`.
+    values = "[0, null, 2000, 1000, 0]"
+    for source, target in [(pa.time32("s"), pa.time32("s")), (pa.time32("s"), pa.int32()), (pa.int32(), pa.time32("s")),
+                           (pa.time64("us"), pa.time64("us")), (pa.time64("us"), pa.int64()), (pa.int64(), pa.time64("us"))]:
+        yield check(J(source, values), J(target, values))
+
+
+STRING_TYPES = [pa.utf8(), pa.string_view(), pa.large_utf8()]
+
+
+@cpp_test("DateToString")
+def _():
+    for string_type in STRING_TYPES:
+        yield check(J(pa.date32(), "[0, null]"), J(string_type, '["1970-01-01", null]'))
+        yield check(J(pa.date64(), "[86400000, null]"), J(string_type, '["1970-01-02", null]'))
+
+
+@cpp_test("TimeToString")
+def _():
+    for string_type in STRING_TYPES:
+        yield check(J(pa.time32("s"), "[1, 62]"), J(string_type, '["00:00:01", "00:01:02"]'))
+        yield check(J(pa.time64("ns"), "[0, 1]"), J(string_type, '["00:00:00.000000000", "00:00:00.000000001"]'))
+
+
+@cpp_test("TimestampToString")
+def _():
+    for string_type in STRING_TYPES:
+        yield check(J(pa.timestamp("s"), "[-30610224000, -5364662400]"), J(string_type, '["1000-01-01 00:00:00", "1800-01-01 00:00:00"]'))
+        yield check(J(pa.timestamp("ms"), "[-30610224000000, -5364662400000]"), J(string_type, '["1000-01-01 00:00:00.000", "1800-01-01 00:00:00.000"]'))
+        yield check(J(pa.timestamp("us"), "[-30610224000000000, -5364662400000000]"), J(string_type, '["1000-01-01 00:00:00.000000", "1800-01-01 00:00:00.000000"]'))
+        yield check(J(pa.timestamp("ns"), "[-596933876543210988, 349837323456789012]"), J(string_type, '["1951-02-01 01:02:03.456789012", "1981-02-01 01:02:03.456789012"]'))
+
+
+@cpp_test("TimestampWithZoneToString")
+def _():
+    for string_type in STRING_TYPES:
+        yield check(J(pa.timestamp("s", "UTC"), "[-30610224000, -5364662400]"), J(string_type, '["1000-01-01 00:00:00Z", "1800-01-01 00:00:00Z"]'))
+        yield check(J(pa.timestamp("s", "America/Phoenix"), "[-34226955, 1456767743]"), J(string_type, '["1968-11-30 13:30:45-0700", "2016-02-29 10:42:23-0700"]'))
+        yield check(J(pa.timestamp("ms", "America/Phoenix"), "[-34226955877, 1456767743456]"), J(string_type, '["1968-11-30 13:30:44.123-0700", "2016-02-29 10:42:23.456-0700"]'))
+        yield check(J(pa.timestamp("us", "America/Phoenix"), "[-34226955877000, 1456767743456789]"), J(string_type, '["1968-11-30 13:30:44.123000-0700", "2016-02-29 10:42:23.456789-0700"]'))
+        yield check(J(pa.timestamp("ns", "America/Phoenix"), "[-34226955876543211, 1456767743456789246]"), J(string_type, '["1968-11-30 13:30:44.123456789-0700", "2016-02-29 10:42:23.456789246-0700"]'))
+
+
+@cpp_test("DateToDate")
+def _():
+    day_32 = J(pa.date32(), "[0, null, 100, 1, 10]")
+    day_64 = J(pa.date64(), "[0, null, 8640000000, 86400000, 864000000]")
+    yield check(day_32, day_32)
+    yield check(day_64, day_64)
+    yield check(day_32, day_64)
+    yield check(day_64, day_32)
+    truncated = J(pa.date64(), "[0, null, 8640000123, 86400456, 864000789]")
+    yield fails(truncated, pa.date32())
+    yield check(truncated, day_32, allow_time_truncate=True)
+
+
+@cpp_test("DateZeroCopy")
+def _():
+    # The zero copy assertion is `cast::tests::conversion_casts_reuse_buffers`.
+    for source, target, values in [
+        (pa.date32(), pa.date32(), "[0, null, 2000, 1000, 0]"), (pa.date32(), pa.int32(), "[0, null, 2000, 1000, 0]"),
+        (pa.int32(), pa.date32(), "[0, null, 2000, 1000, 0]"),
+        (pa.date64(), pa.date64(), "[0, null, 172800000, 86400000, 0]"), (pa.date64(), pa.int64(), "[0, null, 172800000, 86400000, 0]"),
+        (pa.int64(), pa.date64(), "[0, null, 172800000, 86400000, 0]"),
+    ]:
+        yield check(J(source, values), J(target, values))
+
+
+@cpp_test("DurationToDuration")
+def _():
+    d = pa.duration
+    yield from _coarse_and_fine(None, [
+        (d("s"), d("ms"), "[0, null, 200000, 1000, 2000]", "[0, null, 200456, 1123, 2456]"),
+        (d("ms"), d("us"), "[0, null, 200000, 1000, 2000]", "[0, null, 200456, 1123, 2456]"),
+        (d("us"), d("ns"), "[0, null, 200000, 1000, 2000]", "[0, null, 200456, 1123, 2456]"),
+        (d("s"), d("us"), "[0, null, 200000000, 1000000, 2000000]", "[0, null, 200000456, 1000123, 2000456]"),
+        (d("ms"), d("ns"), "[0, null, 200000000, 1000000, 2000000]", "[0, null, 200000456, 1000123, 2000456]"),
+        (d("s"), d("ns"), "[0, null, 200000000000, 1000000000, 2000000000]", "[0, null, 200000000456, 1000000123, 2000000456]"),
+    ])
+
+
+@cpp_test("DurationZeroCopy")
+def _():
+    # The zero copy assertion is `cast::tests::conversion_casts_reuse_buffers`.
+    values = "[0, null, 2000, 1000, 0]"
+    for source, target in [(pa.duration("s"), pa.duration("s")), (pa.duration("s"), pa.int64()), (pa.int64(), pa.duration("s"))]:
+        yield check(J(source, values), J(target, values))
+
+
+@cpp_test("DurationToDurationMultiplyOverflow")
+def _():
+    yield fails(J(pa.duration("s"), "[10000000000, 1, 2, 3, 10000000000]"), pa.duration("ns"))
+
+
+@cpp_test("DurationToString")
+def _():
+    for string_type in STRING_TYPES:
+        for unit in UNITS:
+            yield check(J(pa.duration(unit), "[0, null, 1234567, 2000]"), J(string_type, '["0", null, "1234567", "2000"]'))
+
+
+@cpp_test("MiscToFloating")
+def _():
+    for to in [pa.float32(), pa.float64()]:
+        yield check(J(pa.int16(), "[0, null, 200, 1, 2]"), J(to, "[0, null, 200, 1, 2]"))
+        yield check(J(pa.float32(), "[0, null, 200, 1, 2]"), J(to, "[0, null, 200, 1, 2]"))
+        yield check(J(pa.bool_(), "[true, null, false, false, true]"), J(to, "[1, null, 0, 0, 1]"))
 
 
 # One type of every Arrow C++ type id PyArrow can construct, in C++ id order.

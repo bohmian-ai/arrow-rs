@@ -43,6 +43,7 @@ mod list;
 mod map;
 mod run_array;
 mod string;
+mod temporal;
 mod union;
 
 use crate::cast::decimal::*;
@@ -51,6 +52,7 @@ use crate::cast::list::*;
 use crate::cast::map::*;
 use crate::cast::run_array::*;
 use crate::cast::string::*;
+use crate::cast::temporal::*;
 pub use crate::cast::union::*;
 
 use arrow_buffer::IntervalMonthDayNano;
@@ -1076,6 +1078,11 @@ pub(crate) fn cast_with_context(
         // none of its checks refuse one.
         if array.is_empty() {
             return Ok(new_empty_array(to_type));
+        }
+    }
+    if let Some(conversion) = &cast_options.conversion {
+        if let Some(result) = conversion_temporal(array, to_type, conversion) {
+            return result;
         }
     }
     match (from_type, to_type) {

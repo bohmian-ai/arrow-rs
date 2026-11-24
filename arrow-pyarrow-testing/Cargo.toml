@@ -46,7 +46,7 @@ publish = false
 
 [dev-dependencies]
 # Note no dependency on arrow, to ensure arrow-pyarrow can be used by itself
-arrow-array = { path = "../arrow-array" }
+arrow-array = { path = "../arrow-array", features = ["chrono-tz"] }
 arrow-cast = { path = "../arrow-cast" }
 arrow-data = { path = "../arrow-data" }
 arrow-schema = { path = "../arrow-schema" }
