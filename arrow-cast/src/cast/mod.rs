@@ -901,8 +901,10 @@ impl ConversionOptions {
 /// # Errors
 ///
 /// Returns [`ArrowError::NotYetImplemented`] when the C++ operation does not
-/// support the conversion, and [`ArrowError::CastError`] when a value cannot
-/// be converted under `options`.
+/// support the conversion, [`ArrowError::SchemaError`] when the structure of
+/// `to_type` does not fit the array's (C++ `TypeError`), such as a struct
+/// field with no source or a fixed size list of another size, and
+/// [`ArrowError::CastError`] when a value cannot be converted under `options`.
 pub fn cast_with_conversion_options(
     array: &dyn Array,
     to_type: &DataType,
