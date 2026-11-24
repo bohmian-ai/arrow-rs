@@ -40,10 +40,23 @@ FLAGS = (
 )
 
 
+def exportable(array):
+    """`array` without the null data buffer an Arrow C++ cast to a binary view
+    type leaves when every value is inline, which the C Data Interface export
+    dereferences. The values are unchanged."""
+    if pa.types.is_string_view(array.type) or pa.types.is_binary_view(array.type):
+        buffers = array.buffers()
+        data = [buffer for buffer in buffers[2:] if buffer is not None]
+        return pa.Array.from_buffers(
+            array.type, len(array), buffers[:2] + data, array.null_count, array.offset
+        )
+    return array
+
+
 def outcome(run):
     """`("ok", value)` or `(status category, message)` of one Arrow C++ call."""
     try:
-        return ("ok", run())
+        return ("ok", exportable(run()))
     except pa.ArrowNotImplementedError as error:
         return ("NotImplemented", str(error))
     except pa.ArrowInvalid as error:
@@ -66,13 +79,6 @@ def as_scalar_array(scalar):
 def variants(case):
     """Yield `(variant, input array, reference outcome)` for every execution of `case`."""
     array = case.input
-    if not corpus.pyarrow_executes(array.type, case.to):
-        # The C++ test owner verifies this expectation against Arrow C++.
-        if isinstance(case.expect, str):
-            yield ("array", array, (case.expect, "the C++ test's expectation"))
-        else:
-            yield ("array", array, ("ok", case.expect))
-        return
     options = cast_options(case)
     yield ("array", array, outcome(lambda: pc.cast(array, options=options)))
     if not case.variants:
@@ -138,11 +144,7 @@ def executions():
         flags = {flag: bool(case.options.get(flag, False)) for flag in FLAGS}
         for variant, array, reference in variants(case):
             kind, value = reference
-            translation = (
-                translation_error(case, reference)
-                if variant == "array" and corpus.pyarrow_executes(case.input.type, case.to)
-                else None
-            )
+            translation = translation_error(case, reference) if variant == "array" else None
             yield (
                 test,
                 f"{test}#{number} {case.label}",

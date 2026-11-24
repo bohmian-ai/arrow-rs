@@ -372,12 +372,49 @@ fn cast_integer_to_decimal<
     precision: u8,
     scale: i8,
     base: M,
-    cast_options: &CastOptions,
+    cast_options: &CastContext,
 ) -> Result<ArrayRef, ArrowError>
 where
     <T as ArrowPrimitiveType>::Native: ArrowNativeTypeOp + Into<i128>,
     M: ArrowNativeTypeOp + DecimalCast,
 {
+    if cast_options.conversion.is_some() {
+        // Arrow C++ refuses a target that cannot hold every value of the
+        // source type, so no value can then fail to convert.
+        if scale < 0 {
+            return Err(ArrowError::CastError(format!(
+                "Cannot cast {} to {}({precision}, {scale}): scale must be non-negative",
+                T::DATA_TYPE,
+                D::PREFIX
+            )));
+        }
+        let digits = match T::DATA_TYPE {
+            DataType::Int8 | DataType::UInt8 => 3,
+            DataType::Int16 | DataType::UInt16 => 5,
+            DataType::Int32 | DataType::UInt32 => 10,
+            DataType::Int64 => 19,
+            _ => 20,
+        } + scale as u8;
+        if precision < digits {
+            return Err(ArrowError::CastError(format!(
+                "Cannot cast {} to {}({precision}, {scale}): precision must be at least {digits}",
+                T::DATA_TYPE,
+                D::PREFIX
+            )));
+        }
+        let factor = base.pow_wrapping(scale as u32);
+        let array = array.try_unary::<_, D, _>(|v| {
+            integer_to_decimal_native::<_, M>(v)
+                .map(|v| v.mul_wrapping(factor))
+                .ok_or_else(|| {
+                    ArrowError::CastError(format!(
+                        "Cannot cast to {}({precision}, {scale}). Overflowing on {v:?}",
+                        D::PREFIX,
+                    ))
+                })
+        })?;
+        return Ok(Arc::new(array.with_precision_and_scale(precision, scale)?));
+    }
     let overflow = |v: T::Native| {
         ArrowError::CastError(format!(
             "Cannot cast to {}({precision}, {scale}). Overflowing on {v:?}",
@@ -904,6 +941,120 @@ impl<'a> std::ops::Deref for CastContext<'a> {
 
 /// The cast dispatcher behind [`cast_with_options`] and
 /// [`cast_with_conversion_options`].
+/// Whether Arrow C++ 24.0.0 registers a cast kernel from `from` to `to`.
+///
+/// This is the C++ cast function table, keyed by type id as C++ `CanCast`
+/// is, so type parameters such as a decimal's precision or a list's item do
+/// not take part. A registered kernel can still refuse a value or a type
+/// parameter when it runs.
+pub(crate) fn cpp_registered(from: &DataType, to: &DataType) -> bool {
+    use DataType::*;
+    let integer = from.is_integer();
+    let floating = matches!(from, Float32 | Float64);
+    let decimal = matches!(
+        from,
+        Decimal32(..) | Decimal64(..) | Decimal128(..) | Decimal256(..)
+    );
+    let base_binary = matches!(from, Utf8 | LargeUtf8 | Binary | LargeBinary);
+    let view = matches!(from, Utf8View | BinaryView);
+    let dictionary = matches!(from, Dictionary(..));
+    let null = matches!(from, Null);
+    let temporal_to_string = matches!(
+        from,
+        Date32 | Date64 | Time32(_) | Time64(_) | Timestamp(..) | Duration(_)
+    );
+    match to {
+        Null => dictionary,
+        Boolean => {
+            null || dictionary
+                || matches!(from, Boolean)
+                || integer
+                || floating
+                || base_binary
+                || view
+        }
+        Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64 => {
+            null || dictionary
+                || matches!(from, Boolean | Float16)
+                || integer
+                || floating
+                || decimal
+                || base_binary
+                || view
+                || (matches!(to, Int32) && matches!(from, Date32 | Time32(_)))
+                || (matches!(to, Int64)
+                    && matches!(from, Date64 | Time64(_) | Timestamp(..) | Duration(_)))
+        }
+        Float16 => null || dictionary || integer || floating || base_binary,
+        Float32 | Float64 => {
+            null || dictionary
+                || matches!(from, Boolean | Float16)
+                || integer
+                || floating
+                || decimal
+                || base_binary
+                || view
+        }
+        Decimal32(..) | Decimal64(..) | Decimal128(..) | Decimal256(..) => {
+            null || dictionary || integer || floating || decimal || base_binary || view
+        }
+        Utf8 | LargeUtf8 | Utf8View => {
+            (dictionary && !matches!(to, Utf8View))
+                || null
+                || matches!(from, Boolean | Float16 | FixedSizeBinary(_))
+                || integer
+                || floating
+                || decimal
+                || base_binary
+                || view
+                || temporal_to_string
+        }
+        Binary | LargeBinary | BinaryView | FixedSizeBinary(_) => {
+            (dictionary && !matches!(to, BinaryView))
+                || null
+                || base_binary
+                || view
+                || matches!(from, FixedSizeBinary(_))
+        }
+        Date32 | Date64 => {
+            null || dictionary
+                || matches!(from, Utf8 | LargeUtf8 | Date32 | Date64 | Timestamp(..))
+                || (matches!(to, Date32) && matches!(from, Int32))
+                || (matches!(to, Date64) && matches!(from, Int64))
+        }
+        Time32(_) | Time64(_) => {
+            null || dictionary
+                || matches!(from, Time32(_) | Time64(_) | Timestamp(..))
+                || (matches!(to, Time32(_)) && matches!(from, Int32))
+                || (matches!(to, Time64(_)) && matches!(from, Int64))
+        }
+        Timestamp(..) => {
+            null || dictionary
+                || matches!(
+                    from,
+                    Int64 | Utf8 | LargeUtf8 | Date32 | Date64 | Timestamp(..)
+                )
+        }
+        Duration(_) => null || dictionary || matches!(from, Int64 | Duration(_)),
+        Interval(IntervalUnit::MonthDayNano) => null || dictionary,
+        List(_) | LargeList(_) | FixedSizeList(..) => {
+            null || matches!(
+                from,
+                List(_)
+                    | LargeList(_)
+                    | ListView(_)
+                    | LargeListView(_)
+                    | FixedSizeList(..)
+                    | Map(..)
+            )
+        }
+        Map(..) => null || matches!(from, Map(..)),
+        Struct(_) => null || matches!(from, Struct(_)),
+        Dictionary(..) => null || dictionary || base_binary,
+        _ => false,
+    }
+}
+
 pub(crate) fn cast_with_context(
     array: &dyn Array,
     to_type: &DataType,
@@ -914,6 +1065,11 @@ pub(crate) fn cast_with_context(
     // clone array if types are the same
     if from_type == to_type {
         return Ok(make_array(array.to_data()));
+    }
+    if cast_options.conversion.is_some() && !cpp_registered(from_type, to_type) {
+        return Err(ArrowError::NotYetImplemented(format!(
+            "Unsupported cast from {from_type} to {to_type}"
+        )));
     }
     match (from_type, to_type) {
         (Null, _) => Ok(new_null_array(to_type, array.len())),
@@ -2559,7 +2715,7 @@ fn cast_to_decimal<D, M>(
     scale: &i8,
     from_type: &DataType,
     to_type: &DataType,
-    cast_options: &CastOptions,
+    cast_options: &CastContext,
 ) -> Result<ArrayRef, ArrowError>
 where
     D: DecimalType + ArrowPrimitiveType<Native = M>,

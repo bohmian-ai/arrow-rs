@@ -40,6 +40,9 @@ pub(crate) fn dictionary_cast<K: ArrowDictionaryKeyType>(
     }
 
     let array = array.as_dictionary::<K>();
+    if cast_options.conversion.is_some() && !matches!(to_type, Dictionary(..)) {
+        return conversion_unpack_dictionary(array, to_type, cast_options);
+    }
     let from_child_type = array.values().data_type();
     match (from_child_type, to_type) {
         (_, Dictionary(to_index_type, to_value_type)) => {
@@ -312,14 +315,42 @@ pub(crate) fn unpack_dictionary<K: ArrowDictionaryKeyType>(
     to_type: &DataType,
     cast_options: &CastContext,
 ) -> Result<ArrayRef, ArrowError> {
-    if cast_options.conversion.is_some() {
-        // Arrow C++ selects the values the keys reference before converting
-        // them, so an unreferenced value is never converted.
-        let values = take(array.values().as_ref(), array.keys(), None)?;
-        return cast_with_context(values.as_ref(), to_type, cast_options);
-    }
     let cast_dict_values = cast_with_context(array.values(), to_type, cast_options)?;
     take(cast_dict_values.as_ref(), array.keys(), None)
+}
+
+/// Unpacks a dictionary to a non-dictionary type as Arrow C++ does.
+///
+/// A cast to null yields nulls. Otherwise the values the keys reference are
+/// selected first and only those are converted, so an unreferenced value is
+/// never converted.
+///
+/// # Errors
+///
+/// Returns [`ArrowError::NotYetImplemented`] for binary view values, which
+/// Arrow C++ cannot select, and [`ArrowError::CastError`] when the value type
+/// has no cast to `to_type` or a referenced value fails to convert.
+fn conversion_unpack_dictionary<K: ArrowDictionaryKeyType>(
+    array: &DictionaryArray<K>,
+    to_type: &DataType,
+    cast_options: &CastContext,
+) -> Result<ArrayRef, ArrowError> {
+    let value_type = array.values().data_type();
+    if to_type == &DataType::Null {
+        return Ok(new_null_array(to_type, array.len()));
+    }
+    if matches!(value_type, DataType::Utf8View | DataType::BinaryView) {
+        return Err(ArrowError::NotYetImplemented(format!(
+            "Selecting {value_type} dictionary values is not supported"
+        )));
+    }
+    if value_type != to_type && !cpp_registered(value_type, to_type) {
+        return Err(ArrowError::CastError(format!(
+            "Cast type {to_type} incompatible with dictionary type {value_type}"
+        )));
+    }
+    let values = take(array.values().as_ref(), array.keys(), None)?;
+    cast_with_context(values.as_ref(), to_type, cast_options)
 }
 
 /// Pack a data type into a dictionary array passing the values through a primitive array

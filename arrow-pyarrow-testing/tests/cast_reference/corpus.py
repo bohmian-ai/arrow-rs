@@ -454,13 +454,31 @@ def _():
     yield from _wide_decimal_to_int(pa.decimal128)
 
 
-def pyarrow_executes(from_type, to):
-    """Whether PyArrow 24.0.0 faithfully executes the C++ cast of `from_type`
-    to `to`. Its result of a FixedSizeBinary to binary view or string view
-    cast crashes when accessed, so those cases use the C++ test's expectation,
-    which the C++ test suite verifies."""
-    views = (pa.types.is_binary_view(to) or pa.types.is_string_view(to))
-    return not (pa.types.is_fixed_size_binary(from_type) and views)
+# One type of every Arrow C++ type id PyArrow can construct, in C++ id order.
+REGISTRATION_TYPES = [
+    pa.null(), pa.bool_(), *INTEGER, pa.float16(), pa.float32(), pa.float64(),
+    pa.decimal32(5, 2), pa.decimal64(5, 2), pa.decimal128(5, 2), pa.decimal256(5, 2),
+    pa.utf8(), pa.large_utf8(), pa.string_view(), pa.binary(), pa.large_binary(), pa.binary_view(),
+    pa.binary(3), pa.date32(), pa.date64(), pa.time32("s"), pa.time64("us"), pa.timestamp("s"),
+    pa.duration("s"), pa.month_day_nano_interval(), pa.list_(pa.int8()), pa.large_list(pa.int8()),
+    pa.list_view(pa.int8()), pa.large_list_view(pa.int8()), pa.list_(pa.int8(), 2),
+    pa.map_(pa.utf8(), pa.int8()), pa.struct([("a", pa.int8())]),
+    pa.sparse_union([pa.field("a", pa.int8())]), pa.dense_union([pa.field("a", pa.int8())]),
+    pa.dictionary(pa.int8(), pa.utf8()), pa.run_end_encoded(pa.int32(), pa.int8()),
+]
+
+
+def registration_sweep():
+    """Beyond the C++ tests: the cast of an all-null array between every pair
+    of `REGISTRATION_TYPES`, so the Rust support table is compared with the
+    C++ cast function table for every pair of type ids."""
+    for from_type in REGISTRATION_TYPES:
+        for to in REGISTRATION_TYPES:
+            if from_type != to:
+                yield Case(pa.nulls(2, from_type), to, {}, None, f"{from_type} to {to}", variants=False)
+
+
+_REGISTRY.append(("RegistrationTable", registration_sweep))
 
 
 def cases():

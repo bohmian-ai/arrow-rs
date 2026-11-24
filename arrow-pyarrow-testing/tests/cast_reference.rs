@@ -93,12 +93,12 @@ fn mismatch(
                 None
             }
         }
+        (Ok(_), None) if kind == "supported" => None,
         (Ok(actual), None) => Some(format!(
             "converted to {:?}, reference refused with {kind}: {message}",
             make_array(actual.clone())
         )),
         (Err(error), Some(_)) => Some(format!("refused with {error}, reference converted")),
-        (Ok(_), None) if kind == "supported" => None,
         (Err(error), None) if kind == "supported" => (category(error) == "NotImplemented")
             .then(|| format!("refused as unsupported ({error})")),
         (Err(error), None) if category(error) != kind => Some(format!(
