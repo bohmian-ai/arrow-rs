@@ -23,7 +23,7 @@ use arrow_ord::partition::partition;
 pub(crate) fn run_end_encoded_cast<K: RunEndIndexType>(
     array: &dyn Array,
     to_type: &DataType,
-    cast_options: &CastOptions,
+    cast_options: &CastContext,
 ) -> Result<ArrayRef, ArrowError> {
     match array.data_type() {
         DataType::RunEndEncoded(_, _) => {
@@ -36,7 +36,7 @@ pub(crate) fn run_end_encoded_cast<K: RunEndIndexType>(
                 // Stay as RunEndEncoded, cast only the values
                 DataType::RunEndEncoded(target_index_field, target_value_field) => {
                     let values = run_array.values_slice();
-                    let cast_values = cast_with_options(
+                    let cast_values = cast_with_context(
                         values.as_ref(),
                         target_value_field.data_type(),
                         cast_options,
@@ -44,7 +44,7 @@ pub(crate) fn run_end_encoded_cast<K: RunEndIndexType>(
 
                     let run_ends_array =
                         PrimitiveArray::<K>::from_iter_values(run_array.run_ends().sliced_values());
-                    let cast_run_ends = cast_with_options(
+                    let cast_run_ends = cast_with_context(
                         &run_ends_array,
                         target_index_field.data_type(),
                         cast_options,
@@ -92,7 +92,7 @@ pub(crate) fn run_end_encoded_cast<K: RunEndIndexType>(
 
                     let taken = take(&values, &Int32Array::from_iter_values(indices), None)?;
                     if taken.data_type() != to_type {
-                        cast_with_options(taken.as_ref(), to_type, cast_options)
+                        cast_with_context(taken.as_ref(), to_type, cast_options)
                     } else {
                         Ok(taken)
                     }
@@ -112,7 +112,7 @@ pub(crate) fn run_end_encoded_cast<K: RunEndIndexType>(
 pub(crate) fn cast_to_run_end_encoded<K: RunEndIndexType>(
     array: &ArrayRef,
     value_type: &DataType,
-    cast_options: &CastOptions,
+    cast_options: &CastContext,
 ) -> Result<ArrayRef, ArrowError> {
     let mut run_ends_builder = PrimitiveBuilder::<K>::new();
 
@@ -120,7 +120,7 @@ pub(crate) fn cast_to_run_end_encoded<K: RunEndIndexType>(
     let cast_array = if array.data_type() == value_type {
         array
     } else {
-        &cast_with_options(array, value_type, cast_options)?
+        &cast_with_context(array, value_type, cast_options)?
     };
 
     // Return early if the array to cast is empty

@@ -24,7 +24,7 @@ use crate::cast::*;
 pub(crate) fn dictionary_cast<K: ArrowDictionaryKeyType>(
     array: &dyn Array,
     to_type: &DataType,
-    cast_options: &CastOptions,
+    cast_options: &CastContext,
 ) -> Result<ArrayRef, ArrowError> {
     use DataType::*;
 
@@ -128,7 +128,7 @@ fn dictionary_to_dictionary_cast<K: ArrowDictionaryKeyType>(
     array: &DictionaryArray<K>,
     to_index_type: &DataType,
     to_value_type: &DataType,
-    cast_options: &CastOptions,
+    cast_options: &CastContext,
 ) -> Result<ArrayRef, ArrowError> {
     use DataType::*;
 
@@ -140,7 +140,7 @@ fn dictionary_to_dictionary_cast<K: ArrowDictionaryKeyType>(
     // dictionary is then cast to the requested index/value types.
     if matches!(array.values().data_type(), Dictionary(_, _)) {
         let flattened = take(array.values().as_ref(), array.keys(), None)?;
-        return cast_with_options(
+        return cast_with_context(
             &flattened,
             &Dictionary(
                 Box::new(to_index_type.clone()),
@@ -152,8 +152,8 @@ fn dictionary_to_dictionary_cast<K: ArrowDictionaryKeyType>(
 
     let keys_array: ArrayRef = Arc::new(PrimitiveArray::<K>::from(array.keys().to_data()));
     let values_array = array.values();
-    let cast_keys = cast_with_options(&keys_array, to_index_type, cast_options)?;
-    let cast_values = cast_with_options(values_array, to_value_type, cast_options)?;
+    let cast_keys = cast_with_context(&keys_array, to_index_type, cast_options)?;
+    let cast_values = cast_with_context(values_array, to_value_type, cast_options)?;
 
     // Failure to cast keys (because they don't fit in the
     // target type) results in NULL values;
@@ -208,7 +208,7 @@ fn dictionary_to_dictionary_cast<K: ArrowDictionaryKeyType>(
 fn binary_dict_to_string_view<K: ArrowDictionaryKeyType, O: OffsetSizeTrait>(
     keys: &PrimitiveArray<K>,
     values: &GenericByteArray<GenericBinaryType<O>>,
-    cast_options: &CastOptions,
+    cast_options: &CastContext,
 ) -> Result<ArrayRef, ArrowError> {
     match GenericStringArray::<O>::try_from_binary(values.clone()) {
         Ok(_) => {
@@ -310,9 +310,9 @@ fn view_from_dict_values<K: ArrowDictionaryKeyType, V: ByteArrayType, T: ByteVie
 pub(crate) fn unpack_dictionary<K: ArrowDictionaryKeyType>(
     array: &DictionaryArray<K>,
     to_type: &DataType,
-    cast_options: &CastOptions,
+    cast_options: &CastContext,
 ) -> Result<ArrayRef, ArrowError> {
-    let cast_dict_values = cast_with_options(array.values(), to_type, cast_options)?;
+    let cast_dict_values = cast_with_context(array.values(), to_type, cast_options)?;
     take(cast_dict_values.as_ref(), array.keys(), None)
 }
 
@@ -321,15 +321,15 @@ pub(crate) fn pack_array_to_dictionary_via_primitive<K: ArrowDictionaryKeyType>(
     array: &dyn Array,
     primitive_type: DataType,
     dict_value_type: &DataType,
-    cast_options: &CastOptions,
+    cast_options: &CastContext,
 ) -> Result<ArrayRef, ArrowError> {
-    let primitive = cast_with_options(array, &primitive_type, cast_options)?;
-    let dict = cast_with_options(
+    let primitive = cast_with_context(array, &primitive_type, cast_options)?;
+    let dict = cast_with_context(
         primitive.as_ref(),
         &DataType::Dictionary(Box::new(K::DATA_TYPE), Box::new(primitive_type)),
         cast_options,
     )?;
-    cast_with_options(
+    cast_with_context(
         dict.as_ref(),
         &DataType::Dictionary(Box::new(K::DATA_TYPE), Box::new(dict_value_type.clone())),
         cast_options,
@@ -343,7 +343,7 @@ pub(crate) fn pack_array_to_dictionary_via_primitive<K: ArrowDictionaryKeyType>(
 pub(crate) fn cast_to_dictionary<K: ArrowDictionaryKeyType>(
     array: &dyn Array,
     dict_value_type: &DataType,
-    cast_options: &CastOptions,
+    cast_options: &CastContext,
 ) -> Result<ArrayRef, ArrowError> {
     use DataType::*;
 
@@ -499,9 +499,9 @@ pub(crate) fn cast_to_dictionary<K: ArrowDictionaryKeyType>(
 fn pack_struct_to_dictionary<K: ArrowDictionaryKeyType>(
     array: &dyn Array,
     dict_value_type: &DataType,
-    cast_options: &CastOptions,
+    cast_options: &CastContext,
 ) -> Result<ArrayRef, ArrowError> {
-    let cast_values = cast_with_options(array, dict_value_type, cast_options)?;
+    let cast_values = cast_with_context(array, dict_value_type, cast_options)?;
     let len = cast_values.len();
 
     // Identity keys `[0, 1, ..., len-1]`, with null entries wherever the
@@ -530,14 +530,14 @@ fn pack_struct_to_dictionary<K: ArrowDictionaryKeyType>(
 pub(crate) fn pack_numeric_to_dictionary<K, V>(
     array: &dyn Array,
     dict_value_type: &DataType,
-    cast_options: &CastOptions,
+    cast_options: &CastContext,
 ) -> Result<ArrayRef, ArrowError>
 where
     K: ArrowDictionaryKeyType,
     V: ArrowPrimitiveType,
 {
     // attempt to cast the source array values to the target value type (the dictionary values type)
-    let cast_values = cast_with_options(array, dict_value_type, cast_options)?;
+    let cast_values = cast_with_context(array, dict_value_type, cast_options)?;
     let values = cast_values.as_primitive::<V>();
 
     let mut b = PrimitiveDictionaryBuilder::<K, V>::with_capacity(values.len(), values.len());
@@ -558,7 +558,7 @@ pub(crate) fn pack_decimal_to_dictionary<K, D>(
     dict_value_type: &DataType,
     precision: u8,
     scale: i8,
-    cast_options: &CastOptions,
+    cast_options: &CastContext,
 ) -> Result<ArrayRef, ArrowError>
 where
     K: ArrowDictionaryKeyType,
@@ -645,13 +645,13 @@ where
 // key types of K
 pub(crate) fn pack_byte_to_dictionary<K, T>(
     array: &dyn Array,
-    cast_options: &CastOptions,
+    cast_options: &CastContext,
 ) -> Result<ArrayRef, ArrowError>
 where
     K: ArrowDictionaryKeyType,
     T: ByteArrayType,
 {
-    let cast_values = cast_with_options(array, &T::DATA_TYPE, cast_options)?;
+    let cast_values = cast_with_context(array, &T::DATA_TYPE, cast_options)?;
     let values = cast_values
         .as_any()
         .downcast_ref::<GenericByteArray<T>>()
@@ -667,14 +667,14 @@ where
 // key types of K
 pub(crate) fn pack_byte_to_fixed_size_dictionary<K>(
     array: &dyn Array,
-    cast_options: &CastOptions,
+    cast_options: &CastContext,
     byte_width: i32,
 ) -> Result<ArrayRef, ArrowError>
 where
     K: ArrowDictionaryKeyType,
 {
     let cast_values =
-        cast_with_options(array, &DataType::FixedSizeBinary(byte_width), cast_options)?;
+        cast_with_context(array, &DataType::FixedSizeBinary(byte_width), cast_options)?;
     let values = cast_values
         .as_any()
         .downcast_ref::<FixedSizeBinaryArray>()

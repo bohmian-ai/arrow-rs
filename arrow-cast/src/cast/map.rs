@@ -21,7 +21,7 @@ use crate::cast::*;
 pub(crate) fn cast_map_values(
     from: &MapArray,
     to_data_type: &DataType,
-    cast_options: &CastOptions,
+    cast_options: &CastContext,
     to_ordered: bool,
 ) -> Result<ArrayRef, ArrowError> {
     let DataType::Map(entries_field, _) = to_data_type else {
@@ -37,8 +37,8 @@ pub(crate) fn cast_map_values(
         "map is missing value field".to_string(),
     ))?;
 
-    let key_array = cast_with_options(from.keys(), key_field.data_type(), cast_options)?;
-    let value_array = cast_with_options(from.values(), value_field.data_type(), cast_options)?;
+    let key_array = cast_with_context(from.keys(), key_field.data_type(), cast_options)?;
+    let value_array = cast_with_context(from.values(), value_field.data_type(), cast_options)?;
 
     Ok(Arc::new(MapArray::try_new(
         entries_field.clone(),

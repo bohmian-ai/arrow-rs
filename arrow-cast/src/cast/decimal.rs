@@ -719,7 +719,7 @@ pub(crate) fn cast_decimal_to_integer<D, T>(
     array: &dyn Array,
     base: D::Native,
     scale: i8,
-    cast_options: &CastOptions,
+    cast_options: &CastContext,
 ) -> Result<ArrayRef, ArrowError>
 where
     T: ArrowPrimitiveType,
@@ -777,16 +777,19 @@ where
             }
         }
     } else {
+        // A positive scale divides the fraction away, so a strict cast checks
+        // the remainder first.
+        let fractional =
+            |v: D::Native| cast_options.refuse_fractions && v.mod_wrapping(div) != D::Native::ZERO;
         match cast_options.safe {
             true => {
                 for i in 0..array.len() {
                     if array.is_null(i) {
                         value_builder.append_null();
                     } else {
-                        let v = array
-                            .value(i)
-                            .div_checked(div)
-                            .ok()
+                        let v = Some(array.value(i))
+                            .filter(|v| !fractional(*v))
+                            .and_then(|v| v.div_checked(div).ok())
                             .and_then(<T::Native as NumCast>::from::<D::Native>);
                         value_builder.append_option(v);
                     }
@@ -797,7 +800,14 @@ where
                     if array.is_null(i) {
                         value_builder.append_null();
                     } else {
-                        let v = array.value(i).div_checked(div)?;
+                        let v = array.value(i);
+                        if fractional(v) {
+                            return Err(ArrowError::CastError(format!(
+                                "Can't cast value {v:?} with scale {scale} to type {} without truncating its fraction",
+                                T::DATA_TYPE
+                            )));
+                        }
+                        let v = v.div_checked(div)?;
 
                         let value =
                             <T::Native as NumCast>::from::<D::Native>(v).ok_or_else(|| {

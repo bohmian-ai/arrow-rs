@@ -18,7 +18,7 @@
 //! Cast support for union arrays.
 
 use crate::cast::can_cast_types;
-use crate::cast_with_options;
+use crate::cast::{CastContext, cast_with_context};
 use arrow_array::{Array, ArrayRef, UnionArray};
 use arrow_schema::{ArrowError, DataType, FieldRef, UnionFields};
 use arrow_select::union_extract::union_extract_by_id;
@@ -131,6 +131,22 @@ pub fn union_extract_by_type(
     target_type: &DataType,
     cast_options: &CastOptions,
 ) -> Result<ArrayRef, ArrowError> {
+    union_extract_with_context(
+        union_array,
+        target_type,
+        &CastContext {
+            options: cast_options,
+            refuse_fractions: false,
+        },
+    )
+}
+
+/// [`union_extract_by_type`] under the policy of the cast that reached it.
+pub(crate) fn union_extract_with_context(
+    union_array: &UnionArray,
+    target_type: &DataType,
+    cast_options: &CastContext,
+) -> Result<ArrayRef, ArrowError> {
     let DataType::Union(fields, _) = union_array.data_type() else {
         unreachable!("union_extract_by_type called on non-union array")
     };
@@ -153,7 +169,7 @@ pub fn union_extract_by_type(
         return Ok(extracted);
     }
 
-    cast_with_options(&extracted, target_type, cast_options)
+    cast_with_context(&extracted, target_type, cast_options)
 }
 
 #[cfg(test)]

@@ -792,6 +792,67 @@ pub fn cast_with_options(
     to_type: &DataType,
     cast_options: &CastOptions,
 ) -> Result<ArrayRef, ArrowError> {
+    cast_with_context(
+        array,
+        to_type,
+        &CastContext {
+            options: cast_options,
+            refuse_fractions: false,
+        },
+    )
+}
+
+/// Cast `array` to `to_type` as [`cast_with_options`] does, except that a
+/// floating point or decimal value with a nonzero fraction is not truncated
+/// when it is cast to an integer type.
+///
+/// Such a value is a failed conversion: it becomes `NULL` when
+/// [`CastOptions::safe`] is true and an error when it is false. Integral
+/// values, including negative zero, convert as [`cast_with_options`] converts
+/// them, and NaN, infinite and out-of-range values keep its behavior. The
+/// policy applies wherever a cast reaches such a conversion, including the
+/// values of lists, maps, structs, run-end encoded and dictionary arrays.
+pub fn cast_without_fractional_truncation(
+    array: &dyn Array,
+    to_type: &DataType,
+    cast_options: &CastOptions,
+) -> Result<ArrayRef, ArrowError> {
+    cast_with_context(
+        array,
+        to_type,
+        &CastContext {
+            options: cast_options,
+            refuse_fractions: true,
+        },
+    )
+}
+
+/// The options of one cast and the fractional truncation policy its entry
+/// point selected, passed unchanged through every recursive cast so a nested
+/// conversion applies the same policy as the outer one.
+pub(crate) struct CastContext<'a> {
+    /// The caller's options.
+    pub(crate) options: &'a CastOptions<'a>,
+    /// Whether a float or decimal with a nonzero fraction fails to convert to
+    /// an integer instead of being truncated.
+    pub(crate) refuse_fractions: bool,
+}
+
+impl<'a> std::ops::Deref for CastContext<'a> {
+    type Target = CastOptions<'a>;
+
+    fn deref(&self) -> &CastOptions<'a> {
+        self.options
+    }
+}
+
+/// The cast dispatcher behind [`cast_with_options`] and
+/// [`cast_without_fractional_truncation`].
+pub(crate) fn cast_with_context(
+    array: &dyn Array,
+    to_type: &DataType,
+    cast_options: &CastContext,
+) -> Result<ArrayRef, ArrowError> {
     use DataType::*;
     let from_type = array.data_type();
     // clone array if types are the same
@@ -831,7 +892,7 @@ pub fn cast_with_options(
                 ))),
             }
         }
-        (Union(_, _), _) => union_extract_by_type(
+        (Union(_, _), _) => union_extract_with_context(
             array.as_any().downcast_ref::<UnionArray>().unwrap(),
             to_type,
             cast_options,
@@ -875,7 +936,7 @@ pub fn cast_with_options(
                 ));
             }
             let array = array.as_fixed_size_list();
-            let values = cast_with_options(array.values(), list_to.data_type(), cast_options)?;
+            let values = cast_with_context(array.values(), list_to.data_type(), cast_options)?;
             Ok(Arc::new(FixedSizeListArray::try_new(
                 list_to.clone(),
                 *size_from,
@@ -968,7 +1029,7 @@ pub fn cast_with_options(
         (_, ListView(to)) => cast_values_to_list_view::<i32>(array, to, cast_options),
         (_, LargeListView(to)) => cast_values_to_list_view::<i64>(array, to, cast_options),
         (_, FixedSizeList(to, size)) if *size == 1 => {
-            let values = cast_with_options(array, to.data_type(), cast_options)?;
+            let values = cast_with_context(array, to.data_type(), cast_options)?;
             let list = FixedSizeListArray::try_new(to.clone(), 1, values, None)?;
             Ok(Arc::new(list))
         }
@@ -1699,8 +1760,8 @@ pub fn cast_with_options(
 
         // temporal casts
         (Int32, Date32) => cast_reinterpret_arrays::<Int32Type, Date32Type>(array),
-        (Int32, Date64) => cast_with_options(
-            &cast_with_options(array, &Date32, cast_options)?,
+        (Int32, Date64) => cast_with_context(
+            &cast_with_context(array, &Date32, cast_options)?,
             &Date64,
             cast_options,
         ),
@@ -1712,8 +1773,8 @@ pub fn cast_with_options(
         }
         // No support for microsecond/nanosecond with i32
         (Date32, Int32) => cast_reinterpret_arrays::<Date32Type, Int32Type>(array),
-        (Date32, Int64) => cast_with_options(
-            &cast_with_options(array, &Int32, cast_options)?,
+        (Date32, Int64) => cast_with_context(
+            &cast_with_context(array, &Int32, cast_options)?,
             &Int64,
             cast_options,
         ),
@@ -1723,19 +1784,19 @@ pub fn cast_with_options(
         (Time32(TimeUnit::Millisecond), Int32) => {
             cast_reinterpret_arrays::<Time32MillisecondType, Int32Type>(array)
         }
-        (Time32(TimeUnit::Second), Int64) => cast_with_options(
-            &cast_with_options(array, &Int32, cast_options)?,
+        (Time32(TimeUnit::Second), Int64) => cast_with_context(
+            &cast_with_context(array, &Int32, cast_options)?,
             &Int64,
             cast_options,
         ),
-        (Time32(TimeUnit::Millisecond), Int64) => cast_with_options(
-            &cast_with_options(array, &Int32, cast_options)?,
+        (Time32(TimeUnit::Millisecond), Int64) => cast_with_context(
+            &cast_with_context(array, &Int32, cast_options)?,
             &Int64,
             cast_options,
         ),
         (Int64, Date64) => cast_reinterpret_arrays::<Int64Type, Date64Type>(array),
-        (Int64, Date32) => cast_with_options(
-            &cast_with_options(array, &Int32, cast_options)?,
+        (Int64, Date32) => cast_with_context(
+            &cast_with_context(array, &Int32, cast_options)?,
             &Date32,
             cast_options,
         ),
@@ -1748,8 +1809,8 @@ pub fn cast_with_options(
         }
 
         (Date64, Int64) => cast_reinterpret_arrays::<Date64Type, Int64Type>(array),
-        (Date64, Int32) => cast_with_options(
-            &cast_with_options(array, &Int64, cast_options)?,
+        (Date64, Int32) => cast_with_context(
+            &cast_with_context(array, &Int64, cast_options)?,
             &Int32,
             cast_options,
         ),
@@ -1853,23 +1914,23 @@ pub fn cast_with_options(
         // Timestamp to integer/floating/decimals
         (Timestamp(TimeUnit::Second, _), _) if to_type.is_numeric() => {
             let array = cast_reinterpret_arrays::<TimestampSecondType, Int64Type>(array)?;
-            cast_with_options(&array, to_type, cast_options)
+            cast_with_context(&array, to_type, cast_options)
         }
         (Timestamp(TimeUnit::Millisecond, _), _) if to_type.is_numeric() => {
             let array = cast_reinterpret_arrays::<TimestampMillisecondType, Int64Type>(array)?;
-            cast_with_options(&array, to_type, cast_options)
+            cast_with_context(&array, to_type, cast_options)
         }
         (Timestamp(TimeUnit::Microsecond, _), _) if to_type.is_numeric() => {
             let array = cast_reinterpret_arrays::<TimestampMicrosecondType, Int64Type>(array)?;
-            cast_with_options(&array, to_type, cast_options)
+            cast_with_context(&array, to_type, cast_options)
         }
         (Timestamp(TimeUnit::Nanosecond, _), _) if to_type.is_numeric() => {
             let array = cast_reinterpret_arrays::<TimestampNanosecondType, Int64Type>(array)?;
-            cast_with_options(&array, to_type, cast_options)
+            cast_with_context(&array, to_type, cast_options)
         }
 
         (_, Timestamp(unit, tz)) if from_type.is_numeric() => {
-            let array = cast_with_options(array, &Int64, cast_options)?;
+            let array = cast_with_context(array, &Int64, cast_options)?;
             Ok(make_timestamp_array(
                 array.as_primitive(),
                 *unit,
@@ -1878,7 +1939,7 @@ pub fn cast_with_options(
         }
 
         (Timestamp(from_unit, from_tz), Timestamp(to_unit, to_tz)) => {
-            let array = cast_with_options(array, &Int64, cast_options)?;
+            let array = cast_with_context(array, &Int64, cast_options)?;
             let time_array = array.as_primitive::<Int64Type>();
             let from_size = time_unit_multiple(from_unit);
             let to_size = time_unit_multiple(to_unit);
@@ -2168,14 +2229,14 @@ pub fn cast_with_options(
                 .as_primitive::<Date64Type>()
                 .unary::<_, TimestampSecondType>(|x| x / MILLISECONDS);
 
-            cast_with_options(&array, to_type, cast_options)
+            cast_with_context(&array, to_type, cast_options)
         }
         (Date64, Timestamp(TimeUnit::Millisecond, _)) => {
             let array = array
                 .as_primitive::<Date64Type>()
                 .reinterpret_cast::<TimestampMillisecondType>();
 
-            cast_with_options(&array, to_type, cast_options)
+            cast_with_context(&array, to_type, cast_options)
         }
 
         (Date64, Timestamp(TimeUnit::Microsecond, _)) => {
@@ -2183,28 +2244,28 @@ pub fn cast_with_options(
                 .as_primitive::<Date64Type>()
                 .unary::<_, TimestampMicrosecondType>(|x| x * (MICROSECONDS / MILLISECONDS));
 
-            cast_with_options(&array, to_type, cast_options)
+            cast_with_context(&array, to_type, cast_options)
         }
         (Date64, Timestamp(TimeUnit::Nanosecond, _)) => {
             let array = array
                 .as_primitive::<Date64Type>()
                 .unary::<_, TimestampNanosecondType>(|x| x * (NANOSECONDS / MILLISECONDS));
 
-            cast_with_options(&array, to_type, cast_options)
+            cast_with_context(&array, to_type, cast_options)
         }
         (Date32, Timestamp(TimeUnit::Second, _)) => {
             let array = array
                 .as_primitive::<Date32Type>()
                 .unary::<_, TimestampSecondType>(|x| (x as i64) * SECONDS_IN_DAY);
 
-            cast_with_options(&array, to_type, cast_options)
+            cast_with_context(&array, to_type, cast_options)
         }
         (Date32, Timestamp(TimeUnit::Millisecond, _)) => {
             let array = array
                 .as_primitive::<Date32Type>()
                 .unary::<_, TimestampMillisecondType>(|x| (x as i64) * MILLISECONDS_IN_DAY);
 
-            cast_with_options(&array, to_type, cast_options)
+            cast_with_context(&array, to_type, cast_options)
         }
         (Date32, Timestamp(TimeUnit::Microsecond, _)) => {
             let date_array = array.as_primitive::<Date32Type>();
@@ -2217,7 +2278,7 @@ pub fn cast_with_options(
                     (x as i64).mul_checked(MICROSECONDS_IN_DAY)
                 })?
             };
-            cast_with_options(&converted, to_type, cast_options)
+            cast_with_context(&converted, to_type, cast_options)
         }
         (Date32, Timestamp(TimeUnit::Nanosecond, _)) => {
             let date_array = array.as_primitive::<Date32Type>();
@@ -2230,32 +2291,32 @@ pub fn cast_with_options(
                     (x as i64).mul_checked(NANOSECONDS_IN_DAY)
                 })?
             };
-            cast_with_options(&converted, to_type, cast_options)
+            cast_with_context(&converted, to_type, cast_options)
         }
 
         (_, Duration(unit)) if from_type.is_numeric() => {
-            let array = cast_with_options(array, &Int64, cast_options)?;
+            let array = cast_with_context(array, &Int64, cast_options)?;
             Ok(make_duration_array(array.as_primitive(), *unit))
         }
         (Duration(TimeUnit::Second), _) if to_type.is_numeric() => {
             let array = cast_reinterpret_arrays::<DurationSecondType, Int64Type>(array)?;
-            cast_with_options(&array, to_type, cast_options)
+            cast_with_context(&array, to_type, cast_options)
         }
         (Duration(TimeUnit::Millisecond), _) if to_type.is_numeric() => {
             let array = cast_reinterpret_arrays::<DurationMillisecondType, Int64Type>(array)?;
-            cast_with_options(&array, to_type, cast_options)
+            cast_with_context(&array, to_type, cast_options)
         }
         (Duration(TimeUnit::Microsecond), _) if to_type.is_numeric() => {
             let array = cast_reinterpret_arrays::<DurationMicrosecondType, Int64Type>(array)?;
-            cast_with_options(&array, to_type, cast_options)
+            cast_with_context(&array, to_type, cast_options)
         }
         (Duration(TimeUnit::Nanosecond), _) if to_type.is_numeric() => {
             let array = cast_reinterpret_arrays::<DurationNanosecondType, Int64Type>(array)?;
-            cast_with_options(&array, to_type, cast_options)
+            cast_with_context(&array, to_type, cast_options)
         }
 
         (Duration(from_unit), Duration(to_unit)) => {
-            let array = cast_with_options(array, &Int64, cast_options)?;
+            let array = cast_with_context(array, &Int64, cast_options)?;
             let time_array = array.as_primitive::<Int64Type>();
             let from_size = time_unit_multiple(from_unit);
             let to_size = time_unit_multiple(to_unit);
@@ -2322,7 +2383,7 @@ fn cast_struct_to_struct(
     array: &StructArray,
     from_fields: Fields,
     to_fields: Fields,
-    cast_options: &CastOptions,
+    cast_options: &CastContext,
 ) -> Result<ArrayRef, ArrowError> {
     // Fast path: if field names are in the same order, we can just zip and cast
     let fields_match_order = from_fields.len() == to_fields.len()
@@ -2358,7 +2419,7 @@ fn cast_struct_fields_by_name(
     array: &StructArray,
     from_fields: Fields,
     to_fields: Fields,
-    cast_options: &CastOptions,
+    cast_options: &CastContext,
 ) -> Result<Vec<ArrayRef>, ArrowError> {
     to_fields
         .iter()
@@ -2368,7 +2429,7 @@ fn cast_struct_fields_by_name(
                 .position(|from_field| from_field.name() == to_field.name())
                 .unwrap(); // safe because we checked above
             let column = array.column(from_field_idx);
-            cast_with_options(column, to_field.data_type(), cast_options)
+            cast_with_context(column, to_field.data_type(), cast_options)
         })
         .collect::<Result<Vec<ArrayRef>, ArrowError>>()
 }
@@ -2376,13 +2437,13 @@ fn cast_struct_fields_by_name(
 fn cast_struct_fields_in_order(
     array: &StructArray,
     to_fields: Fields,
-    cast_options: &CastOptions,
+    cast_options: &CastContext,
 ) -> Result<Vec<ArrayRef>, ArrowError> {
     array
         .columns()
         .iter()
         .zip(to_fields.iter())
-        .map(|(l, field)| cast_with_options(l, field.data_type(), cast_options))
+        .map(|(l, field)| cast_with_context(l, field.data_type(), cast_options))
         .collect::<Result<Vec<ArrayRef>, ArrowError>>()
 }
 
@@ -2393,7 +2454,7 @@ fn cast_from_decimal<D, F>(
     from_type: &DataType,
     to_type: &DataType,
     as_float: F,
-    cast_options: &CastOptions,
+    cast_options: &CastContext,
 ) -> Result<ArrayRef, ArrowError>
 where
     D: DecimalType + ArrowPrimitiveType,
@@ -2549,7 +2610,7 @@ const fn time_unit_multiple(unit: &TimeUnit) -> i64 {
 /// Convert Array into a PrimitiveArray of type, and apply numeric cast
 fn cast_numeric_arrays<FROM, TO>(
     from: &dyn Array,
-    cast_options: &CastOptions,
+    cast_options: &CastContext,
 ) -> Result<ArrayRef, ArrowError>
 where
     FROM: ArrowPrimitiveType,
@@ -2557,6 +2618,10 @@ where
     FROM::Native: NumCast,
     TO::Native: NumCast,
 {
+    if cast_options.refuse_fractions && FROM::DATA_TYPE.is_floating() && TO::DATA_TYPE.is_integer()
+    {
+        return integral_numeric_cast::<FROM, TO>(from.as_primitive::<FROM>(), cast_options.safe);
+    }
     if cast_options.safe {
         // If the value can't be casted to the `TO::Native`, return null
         Ok(Arc::new(numeric_cast::<FROM, TO>(
@@ -2568,6 +2633,48 @@ where
             from.as_primitive::<FROM>(),
         )?))
     }
+}
+
+/// Cast floating point `from` to integer type `R`, treating a finite value
+/// with a nonzero fraction as a failed conversion: `NULL` when `safe`, else an
+/// error. Other values convert as [`num_cast`] converts them.
+fn integral_numeric_cast<T, R>(from: &PrimitiveArray<T>, safe: bool) -> Result<ArrayRef, ArrowError>
+where
+    T: ArrowPrimitiveType,
+    R: ArrowPrimitiveType,
+    T::Native: NumCast,
+    R::Native: NumCast,
+{
+    // Every supported float widens to f64 exactly, so its fraction is exact.
+    let fractional = |value: T::Native| {
+        value
+            .to_f64()
+            .is_some_and(|v| v.is_finite() && v.fract() != 0.0)
+    };
+    if safe {
+        return Ok(Arc::new(from.unary_opt::<_, R>(|value| {
+            if fractional(value) {
+                None
+            } else {
+                num_cast::<T::Native, R::Native>(value)
+            }
+        })));
+    }
+    Ok(Arc::new(from.try_unary::<_, R, _>(|value| {
+        if fractional(value) {
+            return Err(ArrowError::CastError(format!(
+                "Can't cast value {value:?} to type {} without truncating its fraction",
+                R::DATA_TYPE
+            )));
+        }
+        num_cast::<T::Native, R::Native>(value).ok_or_else(|| {
+            ArrowError::CastError(format!(
+                "Can't cast value {:?} to type {}",
+                value,
+                R::DATA_TYPE
+            ))
+        })
+    })?))
 }
 
 // Natural cast between numeric types
@@ -7844,6 +7951,201 @@ mod tests {
     }
 
     #[test]
+    fn test_cast_float_to_integer_without_fractional_truncation() {
+        let errors = CastOptions {
+            safe: false,
+            ..Default::default()
+        };
+        let nulls = CastOptions::default();
+        let fraction: ArrayRef = Arc::new(Float64Array::from(vec![1.5]));
+
+        let refused =
+            cast_without_fractional_truncation(&fraction, &DataType::Int64, &errors).unwrap_err();
+        assert!(refused.to_string().contains("fraction"), "{refused}");
+        let truncated = cast_with_options(&fraction, &DataType::Int64, &errors).unwrap();
+        assert_eq!(truncated.as_primitive::<Int64Type>().values(), &[1]);
+
+        let mixed: ArrayRef = Arc::new(Float64Array::from(vec![Some(1.5), Some(2.0), None]));
+        let nulled = cast_without_fractional_truncation(&mixed, &DataType::Int64, &nulls).unwrap();
+        assert_eq!(
+            nulled.as_primitive::<Int64Type>(),
+            &Int64Array::from(vec![None, Some(2), None])
+        );
+
+        let integral: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(-0.0),
+            Some(3.0),
+            None,
+            Some(-4.0),
+        ]));
+        let exact =
+            cast_without_fractional_truncation(&integral, &DataType::Int64, &errors).unwrap();
+        assert_eq!(
+            exact.as_primitive::<Int64Type>(),
+            &Int64Array::from(vec![Some(0), Some(3), None, Some(-4)])
+        );
+
+        let integers = [
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::UInt8,
+            DataType::UInt16,
+            DataType::UInt32,
+            DataType::UInt64,
+        ];
+        let floats: [(ArrayRef, ArrayRef); 3] = [
+            (
+                Arc::new(Float16Array::from(vec![f16::from_f32(2.5)])),
+                Arc::new(Float16Array::from(vec![f16::from_f32(2.0)])),
+            ),
+            (
+                Arc::new(Float32Array::from(vec![2.5])),
+                Arc::new(Float32Array::from(vec![2.0])),
+            ),
+            (
+                Arc::new(Float64Array::from(vec![2.5])),
+                Arc::new(Float64Array::from(vec![2.0])),
+            ),
+        ];
+        for (fraction, whole) in &floats {
+            for integer in &integers {
+                let case = format!("{} to {integer}", fraction.data_type());
+                assert!(
+                    cast_without_fractional_truncation(fraction, integer, &errors).is_err(),
+                    "{case} refuses 2.5"
+                );
+                assert_eq!(
+                    cast_without_fractional_truncation(whole, integer, &errors)
+                        .unwrap()
+                        .to_data(),
+                    cast_with_options(whole, integer, &errors)
+                        .unwrap()
+                        .to_data(),
+                    "{case} converts 2.0"
+                );
+            }
+        }
+
+        let bounds: ArrayRef = Arc::new(Float64Array::from(vec![-128.0, 127.0]));
+        let in_range =
+            cast_without_fractional_truncation(&bounds, &DataType::Int8, &errors).unwrap();
+        assert_eq!(in_range.as_primitive::<Int8Type>().values(), &[-128, 127]);
+        let unsigned: ArrayRef = Arc::new(Float64Array::from(vec![0.0, 255.0]));
+        let in_range =
+            cast_without_fractional_truncation(&unsigned, &DataType::UInt8, &errors).unwrap();
+        assert_eq!(in_range.as_primitive::<UInt8Type>().values(), &[0, 255]);
+
+        let invalid: ArrayRef = Arc::new(Float64Array::from(vec![
+            256.0,
+            -1.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ]));
+        for index in 0..invalid.len() {
+            let value = invalid.slice(index, 1);
+            assert!(
+                cast_without_fractional_truncation(&value, &DataType::UInt8, &errors).is_err(),
+                "{value:?} is out of UInt8 range"
+            );
+        }
+        assert_eq!(
+            cast_without_fractional_truncation(&invalid, &DataType::UInt8, &nulls)
+                .unwrap()
+                .to_data(),
+            cast_with_options(&invalid, &DataType::UInt8, &nulls)
+                .unwrap()
+                .to_data()
+        );
+        assert_eq!(
+            cast_without_fractional_truncation(&invalid, &DataType::UInt8, &nulls)
+                .unwrap()
+                .null_count(),
+            5
+        );
+    }
+
+    #[test]
+    fn test_cast_decimal_to_integer_without_fractional_truncation() {
+        let errors = CastOptions {
+            safe: false,
+            ..Default::default()
+        };
+        let nulls = CastOptions::default();
+        let decimal = |values: Vec<Option<i128>>, scale: i8| -> ArrayRef {
+            Arc::new(
+                Decimal128Array::from(values)
+                    .with_precision_and_scale(20, scale)
+                    .unwrap(),
+            )
+        };
+
+        let fraction = decimal(vec![Some(150)], 2);
+        let refused =
+            cast_without_fractional_truncation(&fraction, &DataType::Int64, &errors).unwrap_err();
+        assert!(refused.to_string().contains("fraction"), "{refused}");
+        let truncated = cast_with_options(&fraction, &DataType::Int64, &errors).unwrap();
+        assert_eq!(truncated.as_primitive::<Int64Type>().values(), &[1]);
+
+        let mixed = decimal(vec![Some(-150), Some(-200), Some(0), None], 2);
+        let nulled = cast_without_fractional_truncation(&mixed, &DataType::Int64, &nulls).unwrap();
+        assert_eq!(
+            nulled.as_primitive::<Int64Type>(),
+            &Int64Array::from(vec![None, Some(-2), Some(0), None])
+        );
+
+        let unscaled = decimal(vec![Some(7), None], 0);
+        let exact =
+            cast_without_fractional_truncation(&unscaled, &DataType::Int8, &errors).unwrap();
+        assert_eq!(
+            exact.as_primitive::<Int8Type>(),
+            &Int8Array::from(vec![Some(7), None])
+        );
+        let negative_scale = decimal(vec![Some(3)], -1);
+        let exact = cast_without_fractional_truncation(&negative_scale, &DataType::UInt16, &errors)
+            .unwrap();
+        assert_eq!(exact.as_primitive::<UInt16Type>().values(), &[30]);
+
+        let out_of_range = decimal(vec![Some(25_600)], 2);
+        assert!(
+            cast_without_fractional_truncation(&out_of_range, &DataType::UInt8, &errors).is_err()
+        );
+        let nulled =
+            cast_without_fractional_truncation(&out_of_range, &DataType::UInt8, &nulls).unwrap();
+        assert!(nulled.is_null(0));
+
+        let decimals: [ArrayRef; 4] = [
+            Arc::new(
+                Decimal32Array::from(vec![250])
+                    .with_precision_and_scale(5, 2)
+                    .unwrap(),
+            ),
+            Arc::new(
+                Decimal64Array::from(vec![250])
+                    .with_precision_and_scale(5, 2)
+                    .unwrap(),
+            ),
+            decimal(vec![Some(250)], 2),
+            Arc::new(
+                Decimal256Array::from(vec![i256::from_i128(250)])
+                    .with_precision_and_scale(5, 2)
+                    .unwrap(),
+            ),
+        ];
+        for fraction in &decimals {
+            for integer in [DataType::Int32, DataType::UInt64] {
+                assert!(
+                    cast_without_fractional_truncation(fraction, &integer, &errors).is_err(),
+                    "{} to {integer} refuses 2.50",
+                    fraction.data_type()
+                );
+            }
+        }
+    }
+
+    #[test]
     #[cfg_attr(miri, ignore)] // Unsupported inline assembly
     fn test_cast_from_f64() {
         let f64_values: Vec<f64> = vec![
@@ -12575,6 +12877,141 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn test_cast_nested_float_to_integer_without_fractional_truncation() {
+        let errors = CastOptions {
+            safe: false,
+            ..Default::default()
+        };
+        let strict = |array: &dyn Array, to_type: &DataType| {
+            cast_without_fractional_truncation(array, to_type, &errors)
+        };
+        let int_item = Arc::new(Field::new_list_field(DataType::Int64, true));
+
+        let list = ListArray::from_iter_primitive::<Float64Type, _, _>(vec![Some(vec![Some(1.5)])]);
+        let to_list = DataType::List(Arc::clone(&int_item));
+        assert!(strict(&list, &to_list).is_err());
+        let truncated = cast_with_options(&list, &to_list, &errors).unwrap();
+        assert_eq!(
+            truncated
+                .as_list::<i32>()
+                .value(0)
+                .as_primitive::<Int64Type>()
+                .values(),
+            &[1]
+        );
+        let large =
+            LargeListArray::from_iter_primitive::<Float64Type, _, _>(vec![Some(vec![Some(1.5)])]);
+        assert!(strict(&large, &DataType::LargeList(Arc::clone(&int_item))).is_err());
+        let fixed = FixedSizeListArray::from_iter_primitive::<Float64Type, _, _>(
+            vec![Some(vec![Some(1.5)])],
+            1,
+        );
+        assert!(strict(&fixed, &DataType::FixedSizeList(Arc::clone(&int_item), 1)).is_err());
+
+        let exact = ListArray::from_iter_primitive::<Float64Type, _, _>(vec![
+            Some(vec![Some(9.0)]),
+            Some(vec![Some(2.0), Some(-0.0)]),
+            None,
+            Some(vec![None]),
+        ])
+        .slice(1, 3);
+        let converted = strict(&exact, &to_list).unwrap();
+        assert_eq!(
+            converted.as_list::<i32>(),
+            &ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+                Some(vec![Some(2), Some(0)]),
+                None,
+                Some(vec![None]),
+            ])
+        );
+        // As the permissive cast checks a slice's hidden values for overflow,
+        // the strict cast checks them for fractions.
+        let hiding = ListArray::from_iter_primitive::<Float64Type, _, _>(vec![
+            Some(vec![Some(2.5)]),
+            Some(vec![Some(3.0)]),
+        ])
+        .slice(1, 1);
+        assert!(strict(&hiding, &to_list).is_err());
+
+        let measured = |x: Vec<Option<f64>>| -> ArrayRef {
+            let names = StringArray::from(vec![Some("a"); x.len()]);
+            Arc::new(StructArray::from(vec![
+                (
+                    Arc::new(Field::new("x", DataType::Float64, true)),
+                    Arc::new(Float64Array::from(x)) as ArrayRef,
+                ),
+                (
+                    Arc::new(Field::new("name", DataType::Utf8, true)),
+                    Arc::new(names) as ArrayRef,
+                ),
+            ]))
+        };
+        let reordered = DataType::Struct(Fields::from(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("x", DataType::Int64, true),
+        ]));
+        assert!(strict(&measured(vec![Some(1.5)]), &reordered).is_err());
+        let converted = strict(&measured(vec![Some(4.0), None]), &reordered).unwrap();
+        let converted = converted.as_struct();
+        assert_eq!(converted.column_names(), ["name", "x"]);
+        assert_eq!(
+            converted.column(1).as_primitive::<Int64Type>(),
+            &Int64Array::from(vec![Some(4), None])
+        );
+
+        let map = |value: f64| -> MapArray {
+            let mut builder = MapBuilder::new(None, StringBuilder::new(), Float64Builder::new());
+            builder.keys().append_value("x");
+            builder.values().append_value(value);
+            builder.append(true).unwrap();
+            builder.finish()
+        };
+        let to_map = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("keys", DataType::Utf8, false),
+                    Field::new("values", DataType::Int64, true),
+                ])),
+                false,
+            )),
+            false,
+        );
+        assert!(strict(&map(1.5), &to_map).is_err());
+        let converted = strict(&map(-0.0), &to_map).unwrap();
+        assert_eq!(
+            converted
+                .as_map()
+                .values()
+                .as_primitive::<Int64Type>()
+                .values(),
+            &[0]
+        );
+
+        let dictionary = |keys: Vec<Option<i8>>, values: Vec<f64>| {
+            DictionaryArray::new(Int8Array::from(keys), Arc::new(Float64Array::from(values)))
+        };
+        let used = dictionary(vec![Some(0), Some(1)], vec![1.5, 2.0]);
+        assert!(strict(&used, &DataType::Int64).is_err());
+        let to_dictionary =
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Int64));
+        assert!(strict(&used, &to_dictionary).is_err());
+        let truncated = cast_with_options(&used, &DataType::Int64, &errors).unwrap();
+        assert_eq!(truncated.as_primitive::<Int64Type>().values(), &[1, 2]);
+        let exact = dictionary(vec![Some(1), None, Some(0)], vec![-0.0, 2.0]);
+        assert_eq!(
+            strict(&exact, &DataType::Int64)
+                .unwrap()
+                .as_primitive::<Int64Type>(),
+            &Int64Array::from(vec![Some(2), None, Some(0)])
+        );
+        // The dictionary's values are cast before its keys select them, so an
+        // unused fractional value is refused as well.
+        let unused = dictionary(vec![Some(1)], vec![1.5, 2.0]);
+        assert!(strict(&unused, &DataType::Int64).is_err());
+    }
+
     #[test]
     fn test_cast_struct_to_struct() {
         let struct_type = DataType::Struct(

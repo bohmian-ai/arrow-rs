@@ -25,7 +25,7 @@ use crate::cast::*;
 pub(crate) fn cast_values_to_list<O: OffsetSizeTrait>(
     array: &dyn Array,
     to: &FieldRef,
-    cast_options: &CastOptions,
+    cast_options: &CastContext,
 ) -> Result<ArrayRef, ArrowError> {
     if array.len() > O::MAX_OFFSET {
         return Err(ArrowError::ComputeError(format!(
@@ -34,7 +34,7 @@ pub(crate) fn cast_values_to_list<O: OffsetSizeTrait>(
             to.data_type()
         )));
     }
-    let values = cast_with_options(array, to.data_type(), cast_options)?;
+    let values = cast_with_context(array, to.data_type(), cast_options)?;
     let offsets = OffsetBuffer::from_repeated_length(1, values.len());
     let list = GenericListArray::<O>::try_new(to.clone(), offsets, values, None)?;
     Ok(Arc::new(list))
@@ -44,7 +44,7 @@ pub(crate) fn cast_values_to_list<O: OffsetSizeTrait>(
 pub(crate) fn cast_values_to_list_view<O: OffsetSizeTrait>(
     array: &dyn Array,
     to: &FieldRef,
-    cast_options: &CastOptions,
+    cast_options: &CastContext,
 ) -> Result<ArrayRef, ArrowError> {
     if array.len() > O::MAX_OFFSET {
         return Err(ArrowError::ComputeError(format!(
@@ -53,7 +53,7 @@ pub(crate) fn cast_values_to_list_view<O: OffsetSizeTrait>(
             to.data_type()
         )));
     }
-    let values = cast_with_options(array, to.data_type(), cast_options)?;
+    let values = cast_with_context(array, to.data_type(), cast_options)?;
     let offsets = (0..values.len())
         .map(|index| O::usize_as(index))
         .collect::<Vec<O>>();
@@ -74,16 +74,16 @@ pub(crate) fn cast_values_to_list_view<O: OffsetSizeTrait>(
 pub(crate) fn cast_single_element_fixed_size_list_to_values(
     array: &dyn Array,
     to: &DataType,
-    cast_options: &CastOptions,
+    cast_options: &CastContext,
 ) -> Result<ArrayRef, ArrowError> {
     let values = array.as_fixed_size_list().values();
-    cast_with_options(values, to, cast_options)
+    cast_with_context(values, to, cast_options)
 }
 
 fn cast_fixed_size_list_to_list_inner<OffsetSize: OffsetSizeTrait, const IS_LIST_VIEW: bool>(
     array: &dyn Array,
     to: &FieldRef,
-    cast_options: &CastOptions,
+    cast_options: &CastContext,
 ) -> Result<ArrayRef, ArrowError> {
     let array = array.as_fixed_size_list();
     let DataType::FixedSizeList(inner_field, size) = array.data_type() else {
@@ -92,7 +92,7 @@ fn cast_fixed_size_list_to_list_inner<OffsetSize: OffsetSizeTrait, const IS_LIST
     let array = if to != inner_field {
         // To transform inner type, can first cast to FSL with new inner type.
         let fsl_to = DataType::FixedSizeList(to.clone(), *size);
-        let array = cast_with_options(array, &fsl_to, cast_options)?;
+        let array = cast_with_context(array, &fsl_to, cast_options)?;
         array.as_fixed_size_list().clone()
     } else {
         array.clone()
@@ -113,7 +113,7 @@ fn cast_fixed_size_list_to_list_inner<OffsetSize: OffsetSizeTrait, const IS_LIST
 pub(crate) fn cast_fixed_size_list_to_list<OffsetSize: OffsetSizeTrait>(
     array: &dyn Array,
     to: &FieldRef,
-    cast_options: &CastOptions,
+    cast_options: &CastContext,
 ) -> Result<ArrayRef, ArrowError> {
     cast_fixed_size_list_to_list_inner::<OffsetSize, false>(array, to, cast_options)
 }
@@ -122,7 +122,7 @@ pub(crate) fn cast_fixed_size_list_to_list<OffsetSize: OffsetSizeTrait>(
 pub(crate) fn cast_fixed_size_list_to_list_view<OffsetSize: OffsetSizeTrait>(
     array: &dyn Array,
     to: &FieldRef,
-    cast_options: &CastOptions,
+    cast_options: &CastContext,
 ) -> Result<ArrayRef, ArrowError> {
     cast_fixed_size_list_to_list_inner::<OffsetSize, true>(array, to, cast_options)
 }
@@ -134,7 +134,7 @@ pub(crate) fn cast_list_to_fixed_size_list<OffsetSize>(
     array: &dyn Array,
     field: &FieldRef,
     size: i32,
-    cast_options: &CastOptions,
+    cast_options: &CastContext,
 ) -> Result<ArrayRef, ArrowError>
 where
     OffsetSize: OffsetSizeTrait,
@@ -211,7 +211,7 @@ where
     };
 
     // Cast the inner values if necessary
-    let values = cast_with_options(values.as_ref(), field.data_type(), cast_options)?;
+    let values = cast_with_context(values.as_ref(), field.data_type(), cast_options)?;
 
     let nulls = null_builder.build();
     // Degenerate case where we may lose length information if there isn't a null
@@ -229,7 +229,7 @@ pub(crate) fn cast_list_view_to_fixed_size_list<O: OffsetSizeTrait>(
     array: &dyn Array,
     field: &FieldRef,
     size: i32,
-    cast_options: &CastOptions,
+    cast_options: &CastContext,
 ) -> Result<ArrayRef, ArrowError> {
     let array = array.as_list_view::<O>();
 
@@ -269,7 +269,7 @@ pub(crate) fn cast_list_view_to_fixed_size_list<O: OffsetSizeTrait>(
     }
 
     let values = make_array(mutable.freeze());
-    let values = cast_with_options(values.as_ref(), field.data_type(), cast_options)?;
+    let values = cast_with_context(values.as_ref(), field.data_type(), cast_options)?;
 
     let nulls = null_builder.build();
     // Degenerate case where we may lose length information if there isn't a null
@@ -286,10 +286,10 @@ pub(crate) fn cast_list_view_to_fixed_size_list<O: OffsetSizeTrait>(
 pub(crate) fn cast_list_values<O: OffsetSizeTrait>(
     array: &dyn Array,
     to: &FieldRef,
-    cast_options: &CastOptions,
+    cast_options: &CastContext,
 ) -> Result<ArrayRef, ArrowError> {
     let list = array.as_list::<O>();
-    let values = cast_with_options(list.values(), to.data_type(), cast_options)?;
+    let values = cast_with_context(list.values(), to.data_type(), cast_options)?;
     Ok(Arc::new(GenericListArray::<O>::try_new(
         to.clone(),
         list.offsets().clone(),
@@ -302,10 +302,10 @@ pub(crate) fn cast_list_values<O: OffsetSizeTrait>(
 pub(crate) fn cast_list_view_values<O: OffsetSizeTrait>(
     array: &dyn Array,
     to: &FieldRef,
-    cast_options: &CastOptions,
+    cast_options: &CastContext,
 ) -> Result<ArrayRef, ArrowError> {
     let list = array.as_list_view::<O>();
-    let values = cast_with_options(list.values(), to.data_type(), cast_options)?;
+    let values = cast_with_context(list.values(), to.data_type(), cast_options)?;
     Ok(Arc::new(GenericListViewArray::<O>::try_new(
         to.clone(),
         list.offsets().clone(),
@@ -319,7 +319,7 @@ pub(crate) fn cast_list_view_values<O: OffsetSizeTrait>(
 pub(crate) fn cast_list<I: OffsetSizeTrait, O: OffsetSizeTrait>(
     array: &dyn Array,
     field: &FieldRef,
-    cast_options: &CastOptions,
+    cast_options: &CastContext,
 ) -> Result<ArrayRef, ArrowError> {
     let list = array.as_list::<I>();
     let values = list.values();
@@ -335,7 +335,7 @@ pub(crate) fn cast_list<I: OffsetSizeTrait, O: OffsetSizeTrait>(
     }
 
     // Recursively cast values
-    let values = cast_with_options(values, field.data_type(), cast_options)?;
+    let values = cast_with_context(values, field.data_type(), cast_options)?;
     let offsets: Vec<_> = offsets.iter().map(|x| O::usize_as(x.as_usize())).collect();
 
     // Safety: valid offsets and checked for overflow
@@ -353,7 +353,7 @@ pub(crate) fn cast_list<I: OffsetSizeTrait, O: OffsetSizeTrait>(
 pub(crate) fn cast_list_view_to_list<I, O>(
     array: &dyn Array,
     to: &FieldRef,
-    cast_options: &CastOptions,
+    cast_options: &CastContext,
 ) -> Result<ArrayRef, ArrowError>
 where
     I: OffsetSizeTrait,
@@ -399,7 +399,7 @@ where
     // Form a contiguous values array
     let take_indices = PrimitiveArray::<O>::from_iter_values(take_indices);
     let values = arrow_select::take::take(list_view.values(), &take_indices, None)?;
-    let values = cast_with_options(&values, to.data_type(), cast_options)?;
+    let values = cast_with_context(&values, to.data_type(), cast_options)?;
 
     Ok(Arc::new(GenericListArray::<O::Native>::try_new(
         to.clone(),
@@ -413,12 +413,12 @@ where
 pub(crate) fn cast_list_view<I: OffsetSizeTrait, O: OffsetSizeTrait>(
     array: &dyn Array,
     to_field: &FieldRef,
-    cast_options: &CastOptions,
+    cast_options: &CastContext,
 ) -> Result<ArrayRef, ArrowError> {
     let list_view = array.as_list_view::<I>();
 
     // Recursively cast values
-    let values = cast_with_options(list_view.values(), to_field.data_type(), cast_options)?;
+    let values = cast_with_context(list_view.values(), to_field.data_type(), cast_options)?;
 
     let offsets = list_view
         .offsets()
@@ -463,7 +463,7 @@ pub(crate) fn cast_list_view<I: OffsetSizeTrait, O: OffsetSizeTrait>(
 pub(crate) fn cast_list_to_list_view<I: OffsetSizeTrait, O: OffsetSizeTrait>(
     array: &dyn Array,
     to_field: &FieldRef,
-    cast_options: &CastOptions,
+    cast_options: &CastContext,
 ) -> Result<ArrayRef, ArrowError> {
     let list = array.as_list::<I>();
     let (_field, offsets, values, nulls) = list.clone().into_parts();
@@ -486,7 +486,7 @@ pub(crate) fn cast_list_to_list_view<I: OffsetSizeTrait, O: OffsetSizeTrait>(
         view_offsets.push(O::usize_as(offset));
         sizes.push(O::usize_as(size));
     }
-    let values = cast_with_options(&values, to_field.data_type(), cast_options)?;
+    let values = cast_with_context(&values, to_field.data_type(), cast_options)?;
     let array = GenericListViewArray::<O>::new(
         to_field.clone(),
         view_offsets.into(),
