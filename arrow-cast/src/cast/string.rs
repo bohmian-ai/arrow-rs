@@ -346,7 +346,7 @@ where
 
 pub(crate) fn cast_binary_to_string<O: OffsetSizeTrait>(
     array: &dyn Array,
-    cast_options: &CastOptions,
+    cast_options: &CastContext,
 ) -> Result<ArrayRef, ArrowError> {
     let array = array
         .as_any()
@@ -355,36 +355,59 @@ pub(crate) fn cast_binary_to_string<O: OffsetSizeTrait>(
 
     match GenericStringArray::<O>::try_from_binary(array.clone()) {
         Ok(a) => Ok(Arc::new(a)),
-        Err(e) => match cast_options.safe {
-            true => {
-                // Fallback to slow method to convert invalid sequences to nulls
-                let mut builder =
-                    GenericStringBuilder::<O>::with_capacity(array.len(), array.value_data().len());
-
-                extend_valid_utf8(&mut builder, array.iter());
-                Ok(Arc::new(builder.finish()))
+        Err(e) => {
+            if cast_options.conversion.is_some() {
+                refuse_invalid_utf8(array.iter())?;
+            } else if !cast_options.safe {
+                return Err(e);
             }
-            false => Err(e),
-        },
+            // Fallback to slow method to convert invalid sequences to nulls
+            let mut builder =
+                GenericStringBuilder::<O>::with_capacity(array.len(), array.value_data().len());
+
+            extend_valid_utf8(&mut builder, array.iter());
+            Ok(Arc::new(builder.finish()))
+        }
     }
+}
+
+/// Refuses the first non-null value that is not UTF-8, as Arrow C++ validates
+/// a binary to string cast. The bytes of null values are not checked: a
+/// caller rebuilds the array without them, since a Rust string array must
+/// hold UTF-8 in every value range.
+///
+/// # Errors
+///
+/// [`ArrowError::CastError`] naming the first invalid value.
+fn refuse_invalid_utf8<'a>(values: impl Iterator<Item = Option<&'a [u8]>>) -> Result<(), ArrowError> {
+    for (index, value) in values.enumerate() {
+        if let Some(Err(error)) = value.map(std::str::from_utf8) {
+            return Err(ArrowError::CastError(format!(
+                "Invalid UTF8 payload at index {index}: {error}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn cast_binary_view_to_string_view(
     array: &dyn Array,
-    cast_options: &CastOptions,
+    cast_options: &CastContext,
 ) -> Result<ArrayRef, ArrowError> {
     let array = array.as_binary_view();
 
     match array.clone().to_string_view() {
         Ok(result) => Ok(Arc::new(result)),
-        Err(error) => match cast_options.safe {
-            true => {
-                let mut builder = StringViewBuilder::with_capacity(array.len());
-                extend_valid_utf8(&mut builder, array.iter());
-                Ok(Arc::new(builder.finish()))
+        Err(error) => {
+            if cast_options.conversion.is_some() {
+                refuse_invalid_utf8(array.iter())?;
+            } else if !cast_options.safe {
+                return Err(error);
             }
-            false => Err(error),
-        },
+            let mut builder = StringViewBuilder::with_capacity(array.len());
+            extend_valid_utf8(&mut builder, array.iter());
+            Ok(Arc::new(builder.finish()))
+        }
     }
 }
 

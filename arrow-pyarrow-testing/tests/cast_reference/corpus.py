@@ -33,6 +33,7 @@ outcome is listed in `MAPPED_ELSEWHERE` with the Rust test that covers it.
 import decimal
 import json
 
+import numpy as np
 import pyarrow as pa
 
 # Every TEST in scalar_cast_test.cc at the pinned commit, in source order.
@@ -95,6 +96,7 @@ class Case:
         self.expect = expect
         self.label = label
         self.variants = variants
+        self.divergence = None
 
 
 def check(input, expected, label="", **options):
@@ -111,6 +113,22 @@ def unsupported(input, to, label=""):
 
 def attempt(input, to, label="", **options):
     return Case(input, to, options, None, label or "attempt")
+
+
+# Why a Rust outcome may differ from Arrow C++, by divergence.
+INVALID_UTF8_STRINGS = (
+    "A Rust string array must hold UTF-8 (`StringArray::value` relies on it "
+    "without checking), so a conversion of binary that Arrow C++ lets produce "
+    "invalid UTF-8 under allow_invalid_utf8 is refused instead."
+)
+
+
+def diverges(input, to, reason, **options):
+    """A cast Rust refuses as `Invalid` where Arrow C++ converts, for `reason`.
+    Only the whole array executes: its variants are separate cases."""
+    case = Case(input, to, options, None, "diverges", variants=False)
+    case.divergence = reason
+    return case
 
 
 _REGISTRY = []
@@ -988,6 +1006,151 @@ def _():
         for date_type in [pa.date32(), pa.date64()]:
             for not_date in ["", "2012-01-xx", "2012-01-01 09:00:00"]:
                 yield fails(J(string_type, [not_date]), date_type)
+
+
+BINARY_TYPES = [pa.binary(), pa.binary_view(), pa.large_binary()]
+STRING_OF_BINARY = {pa.binary(): pa.utf8(), pa.binary_view(): pa.string_view(), pa.large_binary(): pa.large_utf8()}
+BINARY_OF_STRING = {string: binary for binary, string in STRING_OF_BINARY.items()}
+INVALID_UTF8 = [b"Hi", "olá mundo".encode(), "你好世界".encode(), b"", b"\xa0\xa1"]
+FIXED_SIZE_INVALID_UTF8 = [b"Hi!", "lá".encode(), "你".encode(), b"   ", b"\xa0\xa1\xa2"]
+
+
+def invalid_utf8(type, values=INVALID_UTF8):
+    """C++ `InvalidUtf8` and `FixedSizeInvalidUtf8`: the bytes of `values`
+    as `type`, string types included, whose last value is not UTF-8."""
+    if type in BINARY_OF_STRING:
+        return pa.array(values, BINARY_OF_STRING[type]).view(type)
+    return pa.array(values, type)
+
+
+@cpp_test("BinaryToString")
+def _():
+    for bin_type in BINARY_TYPES:
+        for string_type in STRING_TYPES:
+            yield check(pa.array([], bin_type), pa.array([], string_type))
+            yield check(mask_nulls_at(invalid_utf8(bin_type), [4]), mask_nulls_at(invalid_utf8(string_type), [4]))
+            yield fails(invalid_utf8(bin_type), string_type)
+            yield diverges(invalid_utf8(bin_type), string_type, INVALID_UTF8_STRINGS, allow_invalid_utf8=True)
+    from_type = pa.binary(3)
+    for string_type in STRING_TYPES:
+        yield check(pa.array([], from_type), pa.array([], string_type))
+        yield check(
+            mask_nulls_at(invalid_utf8(from_type, FIXED_SIZE_INVALID_UTF8), [4]),
+            mask_nulls_at(invalid_utf8(string_type, FIXED_SIZE_INVALID_UTF8), [4]),
+        )
+        yield fails(invalid_utf8(from_type, FIXED_SIZE_INVALID_UTF8), string_type)
+        yield diverges(invalid_utf8(from_type, FIXED_SIZE_INVALID_UTF8), string_type, INVALID_UTF8_STRINGS, allow_invalid_utf8=True)
+
+
+@cpp_test("BinaryOrStringToBinary")
+def _():
+    # The zero copy assertions are `cast::tests::conversion_casts_reuse_buffers`.
+    for from_type in BASE_BINARY_AND_VIEW:
+        for to_type in BINARY_TYPES:
+            yield check(pa.array([], from_type), pa.array([], to_type))
+            yield check(invalid_utf8(from_type), invalid_utf8(to_type))
+            yield check(mask_nulls_at(invalid_utf8(from_type), [4]), mask_nulls_at(invalid_utf8(to_type), [4]))
+    from_type = pa.binary(3)
+    fixed = invalid_utf8(from_type, FIXED_SIZE_INVALID_UTF8)
+    yield check(fixed, fixed)
+    yield fails(fixed, pa.binary(5))
+    for to_type in BINARY_TYPES:
+        yield check(pa.array([], from_type), pa.array([], to_type))
+        yield check(fixed, invalid_utf8(to_type, FIXED_SIZE_INVALID_UTF8))
+        yield check(mask_nulls_at(fixed, [4]), mask_nulls_at(invalid_utf8(to_type, FIXED_SIZE_INVALID_UTF8), [4]))
+
+
+@cpp_test("StringToString")
+def _():
+    short_input = '["foo", null, "bar", "baz", "quu"]'
+    long_input = '["foofoofoofoofoo", null, "barbarbarbarbarbarbar", "bazbazbazbazbazbazbaz", "quuquuquuquuquuquuquuquuquu"]'
+    combine_input = '["foo", null, "barbarbarbarbarbarbar", "baz", "quu"]'
+    for from_type in STRING_TYPES:
+        for to_type in STRING_TYPES:
+            yield check(pa.array([], from_type), pa.array([], to_type))
+            yield check(mask_nulls_at(invalid_utf8(from_type), [4]), mask_nulls_at(invalid_utf8(to_type), [4]))
+            yield check(invalid_utf8(from_type), invalid_utf8(to_type), allow_invalid_utf8=True)
+            for text in [short_input, long_input, combine_input]:
+                yield check(J(from_type, text), J(to_type, text))
+
+
+@cpp_test("StringToStringWithOffset")
+def _():
+    with_nulls = '["foo", null, "bar", null, "quu", "foo", "baz", "bar", null, "bar", "baz", null]'
+    no_nulls = '["foo", "aa", "bar", "bb", "quu", "foo", "baz", "bar", "cc", "bar", "baz", "foo"]'
+    for from_type in [pa.utf8(), pa.large_utf8()]:
+        for to_type in [pa.utf8(), pa.large_utf8()]:
+            for offset, length in [(3, 5), (8, 2), (10, 1), (12, 0)]:
+                for text in [with_nulls, no_nulls]:
+                    source, target = J(from_type, text), J(to_type, text)
+                    yield check(source.slice(offset), target.slice(offset))
+                    yield check(source.slice(offset, length), target.slice(offset, length))
+
+
+@cpp_test("BinaryOrStringToFixedSizeBinary")
+def _():
+    for in_type in [pa.utf8(), pa.large_utf8(), pa.string_view(), pa.binary(), pa.binary_view(), pa.large_binary()]:
+        valid = J(in_type, '["foo", null, "bar", "baz", "quu"]')
+        yield check(valid, J(pa.binary(3), '["foo", null, "bar", "baz", "quu"]'))
+        yield fails(J(in_type, '["foo", null, "bar", "baz", "quux"]'), pa.binary(3))
+        yield fails(valid, pa.binary(5))
+        yield check(pa.array([], in_type), pa.array([], pa.binary(3)))
+        yield check(pa.array([], in_type), pa.array([], pa.binary(5)))
+
+
+BINARY_OR_STRING_TYPES = [pa.utf8(), pa.string_view(), pa.large_utf8(), pa.binary(), pa.binary_view(), pa.large_binary()]
+
+
+@cpp_test("FixedSizeBinaryToBinaryOrString")
+def _():
+    for out_type in BINARY_OR_STRING_TYPES:
+        yield check(J(pa.binary(3), '["foo", null, "bar", "baz", "quu"]'), J(out_type, '["foo", null, "bar", "baz", "quu"]'))
+        yield check(pa.array([], pa.binary(3)), pa.array([], out_type))
+
+
+@cpp_test("FixedSizeBinaryToBinaryOrStringWithSlice")
+def _():
+    for out_type in BINARY_OR_STRING_TYPES:
+        yield check(J(pa.binary(3), '["foo", null, "bar", "baz", "quu"]').slice(1, 3), J(out_type, '[null, "bar", "baz"]'))
+        yield check(J(pa.binary(3), '["foo", "bar", "baz", "quu"]').slice(1, 3), J(out_type, '["bar", "baz", "quu"]'))
+
+
+@cpp_test("IntToString")
+def _():
+    for string_type in STRING_TYPES:
+        for type, values, strings in [
+            (pa.int8(), "[0, 1, 127, -128, null]", '["0", "1", "127", "-128", null]'),
+            (pa.uint8(), "[0, 1, 255, null]", '["0", "1", "255", null]'),
+            (pa.int16(), "[0, 1, 32767, -32768, null]", '["0", "1", "32767", "-32768", null]'),
+            (pa.uint16(), "[0, 1, 65535, null]", '["0", "1", "65535", null]'),
+            (pa.int32(), "[0, 1, 2147483647, -2147483648, null]", '["0", "1", "2147483647", "-2147483648", null]'),
+            (pa.uint32(), "[0, 1, 4294967295, null]", '["0", "1", "4294967295", null]'),
+            (pa.int64(), "[0, 1, 9223372036854775807, -9223372036854775808, null]", '["0", "1", "9223372036854775807", "-9223372036854775808", null]'),
+            (pa.uint64(), "[0, 1, 18446744073709551615, null]", '["0", "1", "18446744073709551615", null]'),
+        ]:
+            yield check(J(type, values), J(string_type, strings))
+
+
+@cpp_test("FloatingToString")
+def _():
+    for float_type in [pa.float16(), pa.float32(), pa.float64()]:
+        values = [0.0, -0.0, 1.5, float("-inf"), float("inf"), float("nan"), None]
+        if float_type == pa.float16():
+            values = [None if v is None else np.float16(v) for v in values]
+        for string_type in STRING_TYPES:
+            yield check(pa.array(values, float_type), J(string_type, '["0", "-0", "1.5", "-inf", "inf", "nan", null]'))
+
+
+@cpp_test("BooleanToString")
+def _():
+    for string_type in STRING_TYPES:
+        yield check(J(pa.bool_(), "[true, true, false, null]"), J(string_type, '["true", "true", "false", null]'))
+
+
+@cpp_test("ListToPrimitive")
+def _():
+    yield unsupported(J(pa.list_(pa.int8()), "[[1, 2], [3, 4]]"), pa.uint8())
+    yield unsupported(J(pa.list_(pa.binary()), '[["1", "2"], ["3", "4"]]'), pa.utf8())
 
 
 # One type of every Arrow C++ type id PyArrow can construct, in C++ id order.

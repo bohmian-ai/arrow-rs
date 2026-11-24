@@ -41,12 +41,13 @@ FLAGS = (
 
 
 def exportable(array):
-    """`array` without the null data buffer an Arrow C++ cast to a binary view
-    type leaves when every value is inline, which the C Data Interface export
-    dereferences. The values are unchanged."""
+    """`array` with an empty buffer in place of each null data buffer an Arrow
+    C++ cast to a binary view type leaves for a chunk whose values are all
+    inline, which the C Data Interface export dereferences. Buffer indices and
+    values are unchanged."""
     if pa.types.is_string_view(array.type) or pa.types.is_binary_view(array.type):
         buffers = array.buffers()
-        data = [buffer for buffer in buffers[2:] if buffer is not None]
+        data = [pa.py_buffer(b"") if buffer is None else buffer for buffer in buffers[2:]]
         return pa.Array.from_buffers(
             array.type, len(array), buffers[:2] + data, array.null_count, array.offset
         )
@@ -139,7 +140,9 @@ def translation_error(case, reference):
 def executions():
     """Every execution of the corpus as a tuple of the C++ test, case identity,
     variant, input, target type, option flags, reference status, reference
-    message or result, and any disagreement with the C++ test's expectation."""
+    message or result, any disagreement with the C++ test's expectation, and
+    the reason Rust is expected to refuse as `Invalid` where Arrow C++
+    converts, if it is."""
     for test, number, case in corpus.cases():
         flags = {flag: bool(case.options.get(flag, False)) for flag in FLAGS}
         for variant, array, reference in variants(case):
@@ -156,6 +159,7 @@ def executions():
                 value if kind == "ok" else None,
                 str(value) if kind != "ok" else "",
                 translation,
+                case.divergence,
             )
 
 

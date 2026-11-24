@@ -941,8 +941,6 @@ impl<'a> std::ops::Deref for CastContext<'a> {
     }
 }
 
-/// The cast dispatcher behind [`cast_with_options`] and
-/// [`cast_with_conversion_options`].
 /// Whether Arrow C++ 24.0.0 registers a cast kernel from `from` to `to`.
 ///
 /// This is the C++ cast function table, keyed by type id as C++ `CanCast`
@@ -1057,6 +1055,8 @@ pub(crate) fn cpp_registered(from: &DataType, to: &DataType) -> bool {
     }
 }
 
+/// The cast dispatcher behind [`cast_with_options`] and
+/// [`cast_with_conversion_options`].
 pub(crate) fn cast_with_context(
     array: &dyn Array,
     to_type: &DataType,
