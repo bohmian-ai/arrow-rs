@@ -557,6 +557,37 @@ for _name, _arguments in {
     cpp_test(_name)(lambda _arguments=_arguments: _decimal_to_decimal(*_arguments))
 
 
+DECIMALS_5_2 = [pa.decimal32(5, 2), pa.decimal64(5, 2), pa.decimal128(5, 2), pa.decimal256(5, 2)]
+
+
+@cpp_test("FloatingToDecimal")
+def _():
+    for float_type in [pa.float32(), pa.float64()]:
+        for decimal_type in DECIMALS_5_2:
+            yield check(J(float_type, "[0.0, null, 123.45, 123.456, 999.994]"), J(decimal_type, '["0.00", null, "123.45", "123.46", "999.99"]'))
+            yield fails(J(float_type, "[999.996]"), decimal_type)
+            yield check(J(float_type, "[0.0, null, 999.996, 123.45, 999.994]"), J(decimal_type, '["0.00", null, "0.00", "123.45", "999.99"]'), allow_decimal_truncate=True)
+    for decimal_type in [pa.decimal128, pa.decimal256]:
+        yield check(J(pa.float32(), "[1.8446746e+19, -1.8446746e+19]"), J(decimal_type(20, 0), '["18446746272732807168", "-18446746272732807168"]'))
+        yield check(J(pa.float64(), "[1.8446744073709556e+19, -1.8446744073709556e+19]"), J(decimal_type(20, 0), '["18446744073709555712", "-18446744073709555712"]'))
+        yield check(J(pa.float32(), "[1.8446746e+15, -1.8446746e+15]"), J(decimal_type(20, 4), '["1844674629206016.0000", "-1844674629206016.0000"]'))
+        yield check(J(pa.float64(), "[1.8446744073709556e+15, -1.8446744073709556e+15]"), J(decimal_type(20, 4), '["1844674407370955.5000", "-1844674407370955.5000"]'))
+
+
+@cpp_test("DecimalToFloating")
+def _():
+    for float_type in [pa.float32(), pa.float64()]:
+        for decimal_type in DECIMALS_5_2:
+            yield check(J(decimal_type, '["0.00", null, "123.45", "999.99"]'), J(float_type, "[0.0, null, 123.45, 999.99]"))
+
+
+@cpp_test("DecimalToString")
+def _():
+    for string_type in [pa.utf8(), pa.string_view(), pa.large_utf8()]:
+        for decimal_type in DECIMALS_5_2:
+            yield check(J(decimal_type, '["0.00", null, "123.45", "999.99"]'), J(string_type, '["0.00", null, "123.45", "999.99"]'))
+
+
 # One type of every Arrow C++ type id PyArrow can construct, in C++ id order.
 REGISTRATION_TYPES = [
     pa.null(), pa.bool_(), *INTEGER, pa.float16(), pa.float32(), pa.float64(),

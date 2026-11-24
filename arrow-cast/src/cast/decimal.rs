@@ -822,7 +822,7 @@ where
 
 /// A decimal native type whose wrapping arithmetic Arrow C++ uses as the
 /// working width of a decimal to decimal conversion.
-trait WrappingDecimal: ArrowNativeTypeOp {
+pub(crate) trait WrappingDecimal: ArrowNativeTypeOp {
     /// The value, sign extended.
     fn widen(self) -> i256;
     /// The low bits of `value`.
@@ -1164,4 +1164,220 @@ mod tests {
         let result = rescale_decimal::<Decimal128Type, Decimal128Type>(123_i128, 38, 38, 39, 39);
         assert_eq!(result, None);
     }
+}
+
+/// A floating point type Arrow C++ converts to decimals with `FromReal`.
+pub(crate) trait CppReal:
+    ArrowNativeType + PartialOrd + std::ops::Mul<Output = Self> + std::ops::Neg<Output = Self>
+{
+    /// Bits of the significand, including the implicit bit.
+    const MANTISSA_BITS: i32;
+    /// `ceil(log10(2 ^ MANTISSA_BITS))`.
+    const MANTISSA_DIGITS: i32;
+    /// `10 ^ exp`, correctly rounded, as Arrow C++ tabulates it.
+    fn power_of_ten(exp: i32) -> Self;
+    /// The value rounded to an integer, half to even.
+    fn nearbyint(self) -> Self;
+    /// The value, exactly.
+    fn widen(self) -> f64;
+}
+
+impl CppReal for f32 {
+    const MANTISSA_BITS: i32 = 24;
+    const MANTISSA_DIGITS: i32 = 8;
+    fn power_of_ten(exp: i32) -> Self {
+        format!("1e{exp}")
+            .parse()
+            .expect("a power of ten is a valid float literal")
+    }
+    fn nearbyint(self) -> Self {
+        self.round_ties_even()
+    }
+    fn widen(self) -> f64 {
+        self as f64
+    }
+}
+
+impl CppReal for f64 {
+    const MANTISSA_BITS: i32 = 53;
+    const MANTISSA_DIGITS: i32 = 16;
+    fn power_of_ten(exp: i32) -> Self {
+        format!("1e{exp}")
+            .parse()
+            .expect("a power of ten is a valid float literal")
+    }
+    fn nearbyint(self) -> Self {
+        self.round_ties_even()
+    }
+    fn widen(self) -> f64 {
+        self
+    }
+}
+
+/// `ceil(log2(10 ^ k))` for `k` in `0..=76`, as Arrow C++ tabulates it.
+const CEIL_LOG2_POWERS_OF_TEN: [i32; 77] = [
+    0, 4, 7, 10, 14, 17, 20, 24, 27, 30, 34, 37, 40, 44, 47, 50, 54, 57, 60, 64, 67, 70, 74, 77,
+    80, 84, 87, 90, 94, 97, 100, 103, 107, 110, 113, 117, 120, 123, 127, 130, 133, 137, 140, 143,
+    147, 150, 153, 157, 160, 163, 167, 170, 173, 177, 180, 183, 187, 190, 193, 196, 200, 203, 206,
+    210, 213, 216, 220, 223, 226, 230, 233, 236, 240, 243, 246, 250, 253,
+];
+
+/// The normalized fraction in `[0.5, 1)` and the exponent of positive finite `value`.
+fn frexp(value: f64) -> (f64, i32) {
+    let bits = value.to_bits();
+    let exponent = ((bits >> 52) & 0x7ff) as i32;
+    if exponent == 0 {
+        let (fraction, exponent) = frexp(value * 2f64.powi(54));
+        return (fraction, exponent - 54);
+    }
+    let fraction = f64::from_bits((bits & !(0x7ff << 52)) | (1022 << 52));
+    (fraction, exponent - 1022)
+}
+
+/// Non-negative `x` shifted right by `bits`, rounded half to even.
+fn rounded_right_shift(x: i256, bits: i32) -> i256 {
+    use num_traits::{WrappingShl, WrappingShr};
+    if bits == 0 {
+        return x;
+    }
+    if bits >= 256 {
+        return i256::ZERO;
+    }
+    let quotient = x.wrapping_shr(bits as u32);
+    let remainder = x.wrapping_sub(quotient.wrapping_shl(bits as u32));
+    let half = i256::ONE.wrapping_shl(bits as u32 - 1);
+    if remainder > half || (remainder == half && quotient.as_i128() & 1 == 1) {
+        quotient.wrapping_add(i256::ONE)
+    } else {
+        quotient
+    }
+}
+
+/// Converts floating point values to the decimal type `D` as Arrow C++
+/// `Decimal*::FromReal` does: exactly, rounding half to even, through the
+/// binary significand for Decimal64, Decimal128 and Decimal256 with a
+/// non-negative scale, and approximately in floating point otherwise. With
+/// `allow_decimal_truncate` a value that cannot be converted becomes zero.
+///
+/// # Errors
+///
+/// Returns [`ArrowError::CastError`] for the first non-finite value or value
+/// that does not fit the target precision, without `allow_decimal_truncate`.
+pub(crate) fn conversion_real_to_decimal<R, D>(
+    array: &PrimitiveArray<R>,
+    precision: u8,
+    scale: i8,
+    conversion: &ConversionOptions,
+) -> Result<ArrayRef, ArrowError>
+where
+    R: ArrowPrimitiveType,
+    R::Native: CppReal + std::fmt::Display,
+    D: DecimalType,
+    D::Native: WrappingDecimal,
+{
+    use num_traits::WrappingShl;
+    let max_precision = D::MAX_PRECISION as i32;
+    let (p, s) = (precision as i32, scale as i32);
+    let narrow_approx = max_precision <= Decimal64Type::MAX_PRECISION as i32;
+    let real_scale = R::Native::power_of_ten(s);
+    let real_max = R::Native::power_of_ten(p);
+    let limit = R::Native::power_of_ten(p - s.max(0));
+    let ten = |exp: i32| i256::from_i128(10).wrapping_pow(exp as u32);
+    let width = |x: i256| D::Native::wrap(x).widen();
+    let max_abs = ten(p);
+    let overflow = |real: R::Native| {
+        ArrowError::CastError(format!(
+            "Cannot convert {real} to {}({precision}, {scale}): overflow",
+            D::PREFIX
+        ))
+    };
+    let approx = |real: R::Native| -> Result<i256, ArrowError> {
+        let x = if narrow_approx {
+            let x = (real * real_scale).nearbyint();
+            if x >= real_max {
+                return Err(overflow(real));
+            }
+            x.widen()
+        } else {
+            let x = (real.widen() * f64::power_of_ten(s)).nearbyint();
+            if x >= f64::power_of_ten(p) {
+                return Err(overflow(real));
+            }
+            x
+        };
+        i256::from_f64(x).ok_or_else(|| overflow(real))
+    };
+    let from_positive = |real: R::Native| -> Result<i256, ArrowError> {
+        if max_precision == Decimal32Type::MAX_PRECISION as i32 || s < 0 {
+            return approx(real);
+        }
+        if real > limit {
+            return Err(overflow(real));
+        }
+        let (fraction, exponent) = frexp(real.widen());
+        let mantissa = (fraction * 2f64.powi(R::Native::MANTISSA_BITS)) as u64;
+        let k = exponent - R::Native::MANTISSA_BITS;
+        let mut x = i256::from_i128(mantissa as i128);
+        if k < 0 {
+            let mut right_shift_by = -k;
+            let mut mul_by_ten_to = s;
+            let safe = max_precision - R::Native::MANTISSA_DIGITS;
+            if mul_by_ten_to <= safe {
+                x = width(x.wrapping_mul(ten(mul_by_ten_to)));
+                x = width(rounded_right_shift(x, right_shift_by));
+            } else {
+                x = width(x.wrapping_mul(ten(safe)));
+                mul_by_ten_to -= safe;
+                let step = (max_precision - p).max(1);
+                let (mut total_exp, mut total_shift) = (0, 0);
+                while mul_by_ten_to > 0 && right_shift_by > 0 {
+                    let exp = mul_by_ten_to.min(step);
+                    total_exp += exp;
+                    let bits = right_shift_by
+                        .min(CEIL_LOG2_POWERS_OF_TEN[total_exp as usize] - total_shift);
+                    total_shift += bits;
+                    x = width(rounded_right_shift(x, bits));
+                    right_shift_by -= bits;
+                    x = width(x.wrapping_mul(ten(exp)));
+                    mul_by_ten_to -= exp;
+                }
+                if mul_by_ten_to > 0 {
+                    x = width(x.wrapping_mul(ten(mul_by_ten_to)));
+                }
+                if right_shift_by > 0 {
+                    x = width(rounded_right_shift(x, right_shift_by));
+                }
+            }
+        } else {
+            x = width(x.wrapping_mul(ten(s)));
+            x = width(x.wrapping_shl(k as u32));
+        }
+        if x.wrapping_abs() >= max_abs {
+            return Err(overflow(real));
+        }
+        Ok(x)
+    };
+    let zero = R::Native::usize_as(0);
+    let from_real = |real: R::Native| -> Result<i256, ArrowError> {
+        if !real.widen().is_finite() {
+            Err(ArrowError::CastError(format!(
+                "Cannot convert {real} to {}",
+                D::PREFIX
+            )))
+        } else if real == zero {
+            Ok(i256::ZERO)
+        } else if real < zero {
+            from_positive(-real).map(|x| x.wrapping_neg())
+        } else {
+            from_positive(real)
+        }
+    };
+    array
+        .try_unary::<_, D, _>(|real| match from_real(real) {
+            Ok(x) => Ok(D::Native::wrap(x)),
+            Err(_) if conversion.allow_decimal_truncate => Ok(D::Native::usize_as(0)),
+            Err(error) => Err(error),
+        })?
+        .with_precision_and_scale(precision, scale)
+        .map(|array| Arc::new(array) as ArrayRef)
 }

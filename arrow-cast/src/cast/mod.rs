@@ -2752,7 +2752,7 @@ fn cast_to_decimal<D, M>(
 ) -> Result<ArrayRef, ArrowError>
 where
     D: DecimalType + ArrowPrimitiveType<Native = M>,
-    M: ArrowNativeTypeOp + DecimalCast,
+    M: ArrowNativeTypeOp + DecimalCast + WrappingDecimal,
 {
     use DataType::*;
     // cast data to decimal
@@ -2819,12 +2819,34 @@ where
             *scale,
             cast_options,
         ),
+        Float32 if cast_options.conversion.is_some() => {
+            conversion_real_to_decimal::<Float32Type, D>(
+                array.as_primitive::<Float32Type>(),
+                *precision,
+                *scale,
+                cast_options
+                    .conversion
+                    .as_ref()
+                    .expect("guarded by the match arm"),
+            )
+        }
         Float32 => cast_floating_point_to_decimal::<_, D>(
             array.as_primitive::<Float32Type>(),
             *precision,
             *scale,
             cast_options,
         ),
+        Float64 if cast_options.conversion.is_some() => {
+            conversion_real_to_decimal::<Float64Type, D>(
+                array.as_primitive::<Float64Type>(),
+                *precision,
+                *scale,
+                cast_options
+                    .conversion
+                    .as_ref()
+                    .expect("guarded by the match arm"),
+            )
+        }
         Float64 => cast_floating_point_to_decimal::<_, D>(
             array.as_primitive::<Float64Type>(),
             *precision,
