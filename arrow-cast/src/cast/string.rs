@@ -454,3 +454,170 @@ pub(crate) fn cast_utf8view_to_boolean(
 
     cast_string_to_boolean(&array, cast_options)
 }
+
+/// Parses every value of a string or binary array to `to_type` as Arrow C++
+/// `ParseValue` does: integers are an optional `-` and decimal digits or a
+/// `0x` hexadecimal literal of at most the type's width, floats follow
+/// `fast_float` with an optional leading `+`, and booleans are `0`, `1`,
+/// `true` or `false` in any case. Binary values are parsed as bytes.
+///
+/// # Errors
+///
+/// Returns [`ArrowError::CastError`] for the first value that does not parse.
+pub(crate) fn conversion_parse(
+    array: &dyn Array,
+    to_type: &DataType,
+) -> Result<ArrayRef, ArrowError> {
+    use DataType::*;
+    match to_type {
+        Boolean => Ok(Arc::new(
+            parsed(array, to_type, parse_cpp_boolean).collect::<Result<BooleanArray, _>>()?,
+        )),
+        Int8 => parse_primitive::<Int8Type>(array, parse_cpp_integer),
+        Int16 => parse_primitive::<Int16Type>(array, parse_cpp_integer),
+        Int32 => parse_primitive::<Int32Type>(array, parse_cpp_integer),
+        Int64 => parse_primitive::<Int64Type>(array, parse_cpp_integer),
+        UInt8 => parse_primitive::<UInt8Type>(array, parse_cpp_integer),
+        UInt16 => parse_primitive::<UInt16Type>(array, parse_cpp_integer),
+        UInt32 => parse_primitive::<UInt32Type>(array, parse_cpp_integer),
+        UInt64 => parse_primitive::<UInt64Type>(array, parse_cpp_integer),
+        Float16 => parse_primitive::<Float16Type>(array, |s| {
+            parse_cpp_float::<f32>(s).map(half::f16::from_f32)
+        }),
+        Float32 => parse_primitive::<Float32Type>(array, parse_cpp_float::<f32>),
+        Float64 => parse_primitive::<Float64Type>(array, parse_cpp_float::<f64>),
+        _ => unreachable!("only numeric and boolean targets are parsed"),
+    }
+}
+
+/// Copies every value of a string or binary array into a fixed size binary
+/// array of `width`, as Arrow C++ does.
+///
+/// # Errors
+///
+/// Returns [`ArrowError::CastError`] for the first value whose length is not
+/// `width`.
+pub(crate) fn conversion_to_fixed_size_binary(
+    array: &dyn Array,
+    width: i32,
+) -> Result<ArrayRef, ArrowError> {
+    let mut builder = FixedSizeBinaryBuilder::with_capacity(array.len(), width);
+    for value in byte_values(array) {
+        match value {
+            Some(bytes) => builder.append_value(bytes).map_err(|_| {
+                ArrowError::CastError(format!(
+                    "Failed casting from {} to FixedSizeBinary({width}): widths must match",
+                    array.data_type()
+                ))
+            })?,
+            None => builder.append_null(),
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+/// The values of a string or binary array as bytes.
+fn byte_values(array: &dyn Array) -> Box<dyn Iterator<Item = Option<&[u8]>> + '_> {
+    match array.data_type() {
+        DataType::Utf8 => Box::new(
+            array
+                .as_string::<i32>()
+                .iter()
+                .map(|v| v.map(str::as_bytes)),
+        ),
+        DataType::LargeUtf8 => Box::new(
+            array
+                .as_string::<i64>()
+                .iter()
+                .map(|v| v.map(str::as_bytes)),
+        ),
+        DataType::Utf8View => Box::new(array.as_string_view().iter().map(|v| v.map(str::as_bytes))),
+        DataType::Binary => Box::new(array.as_binary::<i32>().iter()),
+        DataType::LargeBinary => Box::new(array.as_binary::<i64>().iter()),
+        DataType::BinaryView => Box::new(array.as_binary_view().iter()),
+        other => unreachable!("{other} is not a string or binary type"),
+    }
+}
+
+/// Parses each non-null value of `array` with `parse`, refusing the first
+/// value that does not parse.
+fn parsed<'a, N: 'a>(
+    array: &'a dyn Array,
+    to_type: &'a DataType,
+    parse: impl Fn(&[u8]) -> Option<N> + 'a,
+) -> impl Iterator<Item = Result<Option<N>, ArrowError>> + 'a {
+    byte_values(array).map(move |value| {
+        value
+            .map(|bytes| {
+                parse(bytes).ok_or_else(|| {
+                    ArrowError::CastError(format!(
+                        "Failed to parse string: '{}' as a scalar of type {to_type}",
+                        String::from_utf8_lossy(bytes),
+                    ))
+                })
+            })
+            .transpose()
+    })
+}
+
+fn parse_primitive<T: ArrowPrimitiveType>(
+    array: &dyn Array,
+    parse: impl Fn(&[u8]) -> Option<T::Native>,
+) -> Result<ArrayRef, ArrowError> {
+    let values = parsed(array, &T::DATA_TYPE, parse).collect::<Result<PrimitiveArray<T>, _>>()?;
+    Ok(Arc::new(values))
+}
+
+fn parse_cpp_boolean(s: &[u8]) -> Option<bool> {
+    match s {
+        b"0" => Some(false),
+        b"1" => Some(true),
+        _ if s.eq_ignore_ascii_case(b"true") => Some(true),
+        _ if s.eq_ignore_ascii_case(b"false") => Some(false),
+        _ => None,
+    }
+}
+
+/// Arrow C++ integer parsing: a `0x` literal of at most twice the type's
+/// byte width in hexadecimal digits, whose bits are reinterpreted for a
+/// signed type, or an optional `-` and decimal digits within range.
+fn parse_cpp_integer<N: NumCast>(s: &[u8]) -> Option<N> {
+    let bits = 8 * std::mem::size_of::<N>() as u32;
+    let signed = <N as NumCast>::from(-1).is_some();
+    if s.len() > 2 && s[0] == b'0' && (s[1] == b'x' || s[1] == b'X') {
+        let digits = &s[2..];
+        if digits.len() > (bits / 4) as usize {
+            return None;
+        }
+        let mut value: u128 = 0;
+        for digit in digits {
+            value = (value << 4) | (*digit as char).to_digit(16)? as u128;
+        }
+        let value = if signed && value >> (bits - 1) == 1 {
+            value as i128 - (1i128 << bits)
+        } else {
+            value as i128
+        };
+        return <N as NumCast>::from(value);
+    }
+    let (negative, digits) = match s {
+        [] | [b'-'] => return None,
+        [b'-', rest @ ..] if signed => (true, rest),
+        _ => (false, s),
+    };
+    let mut value: i128 = 0;
+    for digit in digits {
+        if !digit.is_ascii_digit() {
+            return None;
+        }
+        value = value.checked_mul(10)?.checked_add((digit - b'0') as i128)?;
+    }
+    <N as NumCast>::from(if negative { -value } else { value })
+}
+
+/// Arrow C++ float parsing with `fast_float`: the general format with an
+/// optional leading `+`, `inf`, `infinity` and `nan` in any case, an
+/// out-of-range value saturating, and no surrounding characters.
+fn parse_cpp_float<F: std::str::FromStr>(s: &[u8]) -> Option<F> {
+    std::str::from_utf8(s).ok()?.parse().ok()
+}

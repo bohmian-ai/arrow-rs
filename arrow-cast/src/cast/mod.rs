@@ -1073,6 +1073,15 @@ pub(crate) fn cast_with_context(
     }
     match (from_type, to_type) {
         (Null, _) => Ok(new_null_array(to_type, array.len())),
+        (
+            Utf8 | LargeUtf8 | Utf8View | Binary | LargeBinary | BinaryView,
+            Boolean | Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64 | Float16
+            | Float32 | Float64,
+        ) if cast_options.conversion.is_some() => conversion_parse(array, to_type),
+        (
+            Utf8 | LargeUtf8 | Utf8View | Binary | LargeBinary | BinaryView,
+            FixedSizeBinary(width),
+        ) if cast_options.conversion.is_some() => conversion_to_fixed_size_binary(array, *width),
         (RunEndEncoded(index_type, _), _) => match index_type.data_type() {
             Int16 => run_end_encoded_cast::<Int16Type>(array, to_type, cast_options),
             Int32 => run_end_encoded_cast::<Int32Type>(array, to_type, cast_options),
@@ -1792,6 +1801,17 @@ pub(crate) fn cast_with_context(
                 "Casting from {from_type} to {to_type} not supported",
             ))),
         },
+        (FixedSizeBinary(_), Utf8 | LargeUtf8 | Utf8View) if cast_options.conversion.is_some() => {
+            // Arrow C++ validates the bytes as UTF-8, as a binary to string
+            // cast does.
+            let binary = match to_type {
+                Utf8 => Binary,
+                LargeUtf8 => LargeBinary,
+                _ => BinaryView,
+            };
+            let binary = cast_with_context(array, &binary, cast_options)?;
+            cast_with_context(binary.as_ref(), to_type, cast_options)
+        }
         (FixedSizeBinary(size), _) => match to_type {
             Binary => cast_fixed_size_binary_to_binary::<i32>(array, *size),
             LargeBinary => cast_fixed_size_binary_to_binary::<i64>(array, *size),
