@@ -1098,6 +1098,11 @@ pub(crate) fn cast_with_context(
             Utf8 | LargeUtf8 | Utf8View | Binary | LargeBinary | BinaryView,
             FixedSizeBinary(width),
         ) if cast_options.conversion.is_some() => conversion_to_fixed_size_binary(array, *width),
+        (Map(..), List(_) | LargeList(_) | FixedSizeList(..))
+            if cast_options.conversion.is_some() =>
+        {
+            conversion_map_to_list(array.as_map(), to_type, cast_options)
+        }
         (Utf8 | LargeUtf8, Timestamp(..)) if cast_options.conversion.is_some() => {
             conversion_parse_timestamp(array, to_type)
         }
@@ -1198,6 +1203,12 @@ pub(crate) fn cast_with_context(
         (LargeList(_), LargeList(to)) => cast_list_values::<i64>(array, to, cast_options),
         (FixedSizeList(_, size_from), FixedSizeList(list_to, size_to)) => {
             if size_from != size_to {
+                if cast_options.conversion.is_some() {
+                    // Arrow C++ refuses the size as a type error.
+                    return Err(ArrowError::SchemaError(format!(
+                        "Size of FixedSizeList is not the same: {from_type} to {to_type}"
+                    )));
+                }
                 return Err(ArrowError::CastError(
                     "cannot cast fixed-size-list to fixed-size-list with different size".into(),
                 ));

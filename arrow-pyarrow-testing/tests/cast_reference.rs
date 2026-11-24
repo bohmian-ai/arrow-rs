@@ -64,6 +64,7 @@ fn category(error: &ArrowError) -> String {
     match error {
         ArrowError::NotYetImplemented(_) => "NotImplemented".to_string(),
         ArrowError::CastError(_) => "Invalid".to_string(),
+        ArrowError::SchemaError(_) => "TypeError".to_string(),
         other => format!("unmapped Rust error {other:?}"),
     }
 }

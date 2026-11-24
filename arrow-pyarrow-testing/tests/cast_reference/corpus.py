@@ -111,6 +111,10 @@ def unsupported(input, to, label=""):
     return Case(input, to, {}, "NotImplemented", label or "unsupported")
 
 
+def type_error(input, to, label="", **options):
+    return Case(input, to, options, "TypeError", label or "type error")
+
+
 def attempt(input, to, label="", **options):
     return Case(input, to, options, None, label or "attempt")
 
@@ -183,11 +187,19 @@ def D(type, indices, dictionary):
 
 
 def mask_nulls_at(array, indices):
-    """C++ `MaskArrayWithNullsAt`: the same buffers with `indices` made null."""
+    """C++ `MaskArrayWithNullsAt`, and `TweakValidityBit(array, index, false)`
+    for one index: `array` with `indices` made null and its own buffers and
+    children unchanged."""
+    assert array.offset == 0
     valid = [array[i].is_valid and i not in indices for i in range(len(array))]
     bitmap = pa.array(valid, pa.bool_()).buffers()[1]
-    buffers = array.buffers()
-    return pa.Array.from_buffers(array.type, len(array), [bitmap] + buffers[1:], offset=0) if array.offset == 0 else None
+    if pa.types.is_list(array.type) or pa.types.is_large_list(array.type):
+        own, children = array.buffers()[1:2], [array.values]
+    elif pa.types.is_fixed_size_list(array.type):
+        own, children = [], [array.values]
+    else:
+        own, children = array.buffers()[1:], None
+    return pa.Array.from_buffers(array.type, len(array), [bitmap] + own, children=children)
 
 
 def decimal_unscaled(type, unscaled):
@@ -1151,6 +1163,129 @@ def _():
 def _():
     yield unsupported(J(pa.list_(pa.int8()), "[[1, 2], [3, 4]]"), pa.uint8())
     yield unsupported(J(pa.list_(pa.binary()), '[["1", "2"], ["3", "4"]]'), pa.utf8())
+
+
+LIST_FACTORIES = [pa.list_, pa.large_list]
+
+
+def _list_to_list(value_types, text):
+    for make_src in LIST_FACTORIES:
+        for make_dest in LIST_FACTORIES:
+            for src in value_types:
+                for dest in value_types:
+                    yield check(J(make_src(src), text), J(make_dest(dest), text))
+
+
+@cpp_test("ListToList")
+def _():
+    yield from _list_to_list([pa.int32(), pa.float32(), pa.int64()], "[[0], [1], null, [2, 3, 4], [5, 6], null, [], [7], [8, 9]]")
+
+
+@cpp_test("ListToListNoNulls")
+def _():
+    yield from _list_to_list([pa.int32(), pa.float32(), pa.int64()], "[[0], [1], [2, 3, 4], [5, 6], [], [7], [8, 9]]")
+
+
+@cpp_test("ListToListOptionsPassthru")
+def _():
+    for make_src in LIST_FACTORIES:
+        for make_dest in LIST_FACTORIES:
+            list_int32 = J(make_src(pa.int32()), "[[87654321]]")
+            yield fails(list_int32, make_dest(pa.int16()))
+            yield check(list_int32, J(make_dest(pa.int16()), "[[32689]]"), allow_int_overflow=True)
+
+
+def _fsl_to_fsl(value_types, text, tweaked, children_nulls=True):
+    for src_value in value_types:
+        for dest_value in value_types:
+            src_type, dest_type = pa.list_(src_value, 2), pa.list_(dest_value, 2)
+            src = J(src_type, text)
+            yield check(src, J(dest_type, text))
+            yield check(mask_nulls_at(src, [1]), J(dest_type, tweaked))
+            child = "[1, 2, null, 4, 5, null]" if children_nulls else "[1, 2, 3, 4, 5, 6]"
+            fsl = pa.FixedSizeListArray.from_arrays(J(src_value, child).slice(2), 2)
+            expected = "[null, 4, 5, null]" if children_nulls else "[3, 4, 5, 6]"
+            yield check(fsl, pa.FixedSizeListArray.from_arrays(J(dest_value, expected), 2))
+            yield check(
+                mask_nulls_at(fsl, [1]),
+                J(dest_type, "[[null, 4], null]" if children_nulls else "[[3, 4], null]"),
+            )
+            yield type_error(src, pa.list_(dest_value, 3))
+
+
+@cpp_test("FSLToFSL")
+def _():
+    yield from _fsl_to_fsl([pa.int32(), pa.float32(), pa.int64()], "[[0, 1], [2, 3], [null, 5], null]", "[[0, 1], null, [null, 5], null]")
+
+
+@cpp_test("FSLToFSLNoNulls")
+def _():
+    yield from _fsl_to_fsl([pa.int32(), pa.float32(), pa.int64()], "[[0, 1], [2, 3], [4, 5]]", "[[0, 1], null, [4, 5]]", children_nulls=False)
+
+
+def _options_pass_through(to):
+    fsl_int32 = J(pa.list_(pa.int32(), 1), "[[87654321]]")
+    yield fails(fsl_int32, to)
+    # The C++ test checks the cast to `fixed_size_list<int16>[1]` whatever `to` is.
+    yield check(fsl_int32, J(pa.list_(pa.int16(), 1), "[[32689]]"), allow_int_overflow=True)
+
+
+@cpp_test("FSLToFSLOptionsPassThru")
+def _():
+    yield from _options_pass_through(pa.list_(pa.int16(), 1))
+
+
+@cpp_test("FSLToList")
+def _():
+    nulls = "[[0, 1], [2, 3], [null, 5], null]"
+    yield check(J(pa.list_(pa.int16(), 2), nulls), J(pa.list_(pa.int16()), nulls))
+    yield check(J(pa.list_(pa.int16(), 2), nulls), J(pa.large_list(pa.int16()), nulls))
+    yield check(J(pa.list_(pa.int16(), 2), nulls), J(pa.list_(pa.int32()), nulls))
+    yield check(J(pa.list_(pa.int16(), 2), "[[0, 1], [2, 3], [4, 5]]"), J(pa.list_(pa.int32()), "[[0, 1], [2, 3], [4, 5]]"))
+    nested = "[[[0, 1], [2, 3]], [[4, 5], null]]"
+    yield check(J(pa.list_(pa.list_(pa.int16()), 2), nested), J(pa.list_(pa.list_(pa.int32())), nested))
+    sliced = pa.FixedSizeListArray.from_arrays(J(pa.int32(), "[1, 2, null, 4, 5, null]").slice(2), 2)
+    yield check(sliced, J(pa.list_(pa.int32()), "[[null, 4], [5, null]]"))
+    yield from _options_pass_through(pa.list_(pa.int16()))
+
+
+@cpp_test("ListToFSL")
+def _():
+    nulls = "[[0, 1], [2, 3], null, [null, 5], null]"
+    yield check(J(pa.list_(pa.int16()), nulls), J(pa.list_(pa.int16(), 2), nulls))
+    yield check(J(pa.large_list(pa.int16()), nulls), J(pa.list_(pa.int16(), 2), nulls))
+    yield check(J(pa.list_(pa.int32()), nulls), J(pa.list_(pa.int16(), 2), nulls))
+    yield check(J(pa.list_(pa.int32()), "[[0, 1], [2, 3], [4, 5]]"), J(pa.list_(pa.int16(), 2), "[[0, 1], [2, 3], [4, 5]]"))
+    nested = "[[[0, 1], [2, 3]], [[4, 5], null]]"
+    yield check(J(pa.list_(pa.list_(pa.int32())), nested), J(pa.list_(pa.list_(pa.int16()), 2), nested))
+    sliced = pa.ListArray.from_arrays(J(pa.int32(), "[0, 2, 4]"), J(pa.int32(), "[1, 2, null, 4, 5, null]").slice(2))
+    yield check(sliced, J(pa.list_(pa.int32(), 2), "[[null, 4], [5, null]]"))
+    masked = mask_nulls_at(J(pa.list_(pa.int32()), "[[0, 1], [2, 3], [4, 5], [6, 7], [8, 9]]"), [1, 2, 4])
+    yield check(masked, J(pa.list_(pa.int32(), 2), "[[0, 1], null, null, [6, 7], null]"))
+    yield from _options_pass_through(pa.list_(pa.int16()))
+    yield fails(J(pa.list_(pa.int32()), "[[0, 1, 2], null, [3, 4]]"), pa.list_(pa.int32(), 3))
+
+
+@cpp_test("CastMap")
+def _():
+    map_json = '[[["x", 1], ["y", 8], ["z", 9]], [["x", 6]], [["y", 36]]]'
+    map_json_nullable = '[[["x", 1], ["y", null], ["z", 9]], null, [["y", 36]]]'
+    src_type = pa.map_(pa.field("x", pa.utf8(), False), pa.field("y", pa.int64()))
+    struct = pa.struct([pa.field("a", pa.utf8()), pa.field("b", pa.int64())])
+    for dst_type in [
+        pa.map_(pa.field("a", pa.utf8(), False), pa.field("b", pa.int64())),
+        pa.map_(pa.large_utf8(), pa.field("y", pa.int32())),
+        pa.list_(struct),
+        pa.large_list(struct),
+    ]:
+        for text in [map_json, map_json_nullable]:
+            yield check(J(src_type, text), J(dst_type, text))
+    src_type = pa.map_(pa.utf8(), pa.field("x", pa.list_(pa.field("a", pa.int64()))))
+    dst_type = pa.map_(pa.utf8(), pa.field("y", pa.list_(pa.field("b", pa.int64()))))
+    nested = '[[["1", [1,2,3]]], [["2", [4,5,6]]]]'
+    yield check(J(src_type, nested), J(dst_type, nested))
+    three = pa.list_(pa.struct([pa.field("key", pa.int32()), pa.field("value", pa.int64()), pa.field("extra", pa.int64())]))
+    yield type_error(J(src_type, nested), three)
 
 
 # One type of every Arrow C++ type id PyArrow can construct, in C++ id order.

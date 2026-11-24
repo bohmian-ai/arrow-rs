@@ -53,6 +53,37 @@ pub(crate) fn cast_map_values(
     )?))
 }
 
+/// Casts `from` as Arrow C++ does, as the list of its entries: a list or
+/// large list target must hold a struct of exactly two fields, which take the
+/// key and the value by position.
+///
+/// # Errors
+///
+/// [`ArrowError::SchemaError`], the Arrow C++ type error, for a list item
+/// that is not a struct of two fields, and any error of casting the entries.
+pub(crate) fn conversion_map_to_list(
+    from: &MapArray,
+    to_type: &DataType,
+    cast_options: &CastContext,
+) -> Result<ArrayRef, ArrowError> {
+    if let DataType::List(item) | DataType::LargeList(item) = to_type {
+        if !matches!(item.data_type(), DataType::Struct(fields) if fields.len() == 2) {
+            return Err(ArrowError::SchemaError(format!(
+                "Map type must be cast to a list<struct> with exactly two fields, not {to_type}"
+            )));
+        }
+    }
+    let entries = from.entries();
+    let item = Field::new("entries", entries.data_type().clone(), false);
+    let list = ListArray::try_new(
+        Arc::new(item),
+        from.offsets().clone(),
+        Arc::new(entries.clone()),
+        from.nulls().cloned(),
+    )?;
+    cast_with_context(&list, to_type, cast_options)
+}
+
 /// Gets the key field from the entries of a map.  For all other types returns None.
 pub(crate) fn key_field(entries_field: &FieldRef) -> Option<FieldRef> {
     if let DataType::Struct(fields) = entries_field.data_type() {
