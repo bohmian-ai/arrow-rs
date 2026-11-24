@@ -139,7 +139,10 @@ fn diverged(
             "divergence ({reason}) no longer holds: reference refused with {kind}: {message}"
         )),
         Err(error) if category(error) == "Invalid" => None,
-        Err(error) => Some(format!("divergence refused as {} ({error})", category(error))),
+        Err(error) => Some(format!(
+            "divergence refused as {} ({error})",
+            category(error)
+        )),
         Ok(actual) => Some(format!(
             "divergence ({reason}) converted to {:?}",
             make_array(actual.clone())
@@ -217,7 +220,10 @@ fn cast_matches_arrow_cpp_reference() {
         std::fs::write(path, &report).expect("the report path is writable");
     }
     if !divergences.is_empty() {
-        println!("Recorded divergences from Arrow C++:\n{}", divergences.join("\n"));
+        println!(
+            "Recorded divergences from Arrow C++:\n{}",
+            divergences.join("\n")
+        );
     }
     assert!(executions > 0, "the corpus executed no cases");
     assert!(
