@@ -797,45 +797,109 @@ pub fn cast_with_options(
         to_type,
         &CastContext {
             options: cast_options,
-            refuse_fractions: false,
+            conversion: None,
         },
     )
 }
 
-/// Cast `array` to `to_type` as [`cast_with_options`] does, except that a
-/// floating point or decimal value with a nonzero fraction is not truncated
-/// when it is cast to an integer type.
+/// The value conversion policy of the Apache Arrow C++ cast operation
+/// (`arrow::compute::CastOptions` in Apache Arrow 24.0.0), selected by
+/// [`cast_with_conversion_options`].
 ///
-/// Such a value is a failed conversion: it becomes `NULL` when
-/// [`CastOptions::safe`] is true and an error when it is false. Integral
-/// values, including negative zero, convert as [`cast_with_options`] converts
-/// them, and NaN, infinite and out-of-range values keep its behavior. The
-/// policy applies wherever a cast reaches such a conversion, including the
-/// values of lists, maps, structs, run-end encoded and dictionary arrays.
-pub fn cast_without_fractional_truncation(
+/// Each flag permits one class of lossy conversion that the C++ operation
+/// otherwise refuses. Unlike [`CastOptions::safe`], which chooses whether a
+/// failed conversion becomes `NULL` or an error, a refused conversion is
+/// always an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ConversionOptions {
+    /// Permit an integer that does not fit the target integer type to wrap.
+    pub allow_int_overflow: bool,
+    /// Permit a temporal value to lose precision when converted to a coarser unit.
+    pub allow_time_truncate: bool,
+    /// Permit a temporal value to overflow when converted to a finer unit.
+    pub allow_time_overflow: bool,
+    /// Permit a decimal value to lose digits when rescaled or converted.
+    pub allow_decimal_truncate: bool,
+    /// Permit a floating point value to be truncated to an integer, and an
+    /// integer to lose precision when converted to a floating point type.
+    pub allow_float_truncate: bool,
+    /// Permit binary values that are not valid UTF-8 to become strings.
+    pub allow_invalid_utf8: bool,
+}
+
+impl ConversionOptions {
+    /// Refuse every lossy conversion: Arrow C++ `CastOptions::Safe()`.
+    pub const SAFE: Self = Self {
+        allow_int_overflow: false,
+        allow_time_truncate: false,
+        allow_time_overflow: false,
+        allow_decimal_truncate: false,
+        allow_float_truncate: false,
+        allow_invalid_utf8: false,
+    };
+
+    /// Permit every lossy conversion: Arrow C++ `CastOptions::Unsafe()`.
+    pub const UNSAFE: Self = Self {
+        allow_int_overflow: true,
+        allow_time_truncate: true,
+        allow_time_overflow: true,
+        allow_decimal_truncate: true,
+        allow_float_truncate: true,
+        allow_invalid_utf8: true,
+    };
+}
+
+/// Cast `array` to `to_type` with the semantics of the Apache Arrow C++ 24.0.0
+/// cast operation under `options`.
+///
+/// This shares the dispatcher and kernels of [`cast_with_options`] but
+/// follows the C++ operation wherever the two differ: which conversions are
+/// supported, how values are checked under `options`, the order in which
+/// nested and dictionary values are selected and converted, and how values
+/// are parsed and formatted. Every recursive conversion applies the same
+/// policy.
+///
+/// # Errors
+///
+/// Returns [`ArrowError::NotYetImplemented`] when the C++ operation does not
+/// support the conversion, and [`ArrowError::CastError`] when a value cannot
+/// be converted under `options`.
+pub fn cast_with_conversion_options(
     array: &dyn Array,
     to_type: &DataType,
-    cast_options: &CastOptions,
+    options: &ConversionOptions,
 ) -> Result<ArrayRef, ArrowError> {
+    let cast_options = CastOptions {
+        safe: false,
+        format_options: FormatOptions::default(),
+    };
     cast_with_context(
         array,
         to_type,
         &CastContext {
-            options: cast_options,
-            refuse_fractions: true,
+            options: &cast_options,
+            conversion: Some(*options),
         },
     )
 }
 
-/// The options of one cast and the fractional truncation policy its entry
-/// point selected, passed unchanged through every recursive cast so a nested
+/// The options of one cast and the conversion policy its entry point
+/// selected, passed unchanged through every recursive cast so a nested
 /// conversion applies the same policy as the outer one.
 pub(crate) struct CastContext<'a> {
     /// The caller's options.
     pub(crate) options: &'a CastOptions<'a>,
+    /// The Arrow C++ conversion policy of [`cast_with_conversion_options`],
+    /// or `None` for the existing cast semantics.
+    pub(crate) conversion: Option<ConversionOptions>,
+}
+
+impl CastContext<'_> {
     /// Whether a float or decimal with a nonzero fraction fails to convert to
     /// an integer instead of being truncated.
-    pub(crate) refuse_fractions: bool,
+    pub(crate) fn refuse_fractions(&self) -> bool {
+        self.conversion.is_some_and(|c| !c.allow_float_truncate)
+    }
 }
 
 impl<'a> std::ops::Deref for CastContext<'a> {
@@ -847,7 +911,7 @@ impl<'a> std::ops::Deref for CastContext<'a> {
 }
 
 /// The cast dispatcher behind [`cast_with_options`] and
-/// [`cast_without_fractional_truncation`].
+/// [`cast_with_conversion_options`].
 pub(crate) fn cast_with_context(
     array: &dyn Array,
     to_type: &DataType,
@@ -2618,7 +2682,9 @@ where
     FROM::Native: NumCast,
     TO::Native: NumCast,
 {
-    if cast_options.refuse_fractions && FROM::DATA_TYPE.is_floating() && TO::DATA_TYPE.is_integer()
+    if cast_options.refuse_fractions()
+        && FROM::DATA_TYPE.is_floating()
+        && TO::DATA_TYPE.is_integer()
     {
         return integral_numeric_cast::<FROM, TO>(from.as_primitive::<FROM>(), cast_options.safe);
     }
@@ -7956,21 +8022,14 @@ mod tests {
             safe: false,
             ..Default::default()
         };
-        let nulls = CastOptions::default();
         let fraction: ArrayRef = Arc::new(Float64Array::from(vec![1.5]));
 
         let refused =
-            cast_without_fractional_truncation(&fraction, &DataType::Int64, &errors).unwrap_err();
+            cast_with_conversion_options(&fraction, &DataType::Int64, &ConversionOptions::SAFE)
+                .unwrap_err();
         assert!(refused.to_string().contains("fraction"), "{refused}");
         let truncated = cast_with_options(&fraction, &DataType::Int64, &errors).unwrap();
         assert_eq!(truncated.as_primitive::<Int64Type>().values(), &[1]);
-
-        let mixed: ArrayRef = Arc::new(Float64Array::from(vec![Some(1.5), Some(2.0), None]));
-        let nulled = cast_without_fractional_truncation(&mixed, &DataType::Int64, &nulls).unwrap();
-        assert_eq!(
-            nulled.as_primitive::<Int64Type>(),
-            &Int64Array::from(vec![None, Some(2), None])
-        );
 
         let integral: ArrayRef = Arc::new(Float64Array::from(vec![
             Some(-0.0),
@@ -7979,7 +8038,8 @@ mod tests {
             Some(-4.0),
         ]));
         let exact =
-            cast_without_fractional_truncation(&integral, &DataType::Int64, &errors).unwrap();
+            cast_with_conversion_options(&integral, &DataType::Int64, &ConversionOptions::SAFE)
+                .unwrap();
         assert_eq!(
             exact.as_primitive::<Int64Type>(),
             &Int64Array::from(vec![Some(0), Some(3), None, Some(-4)])
@@ -8013,11 +8073,12 @@ mod tests {
             for integer in &integers {
                 let case = format!("{} to {integer}", fraction.data_type());
                 assert!(
-                    cast_without_fractional_truncation(fraction, integer, &errors).is_err(),
+                    cast_with_conversion_options(fraction, integer, &ConversionOptions::SAFE)
+                        .is_err(),
                     "{case} refuses 2.5"
                 );
                 assert_eq!(
-                    cast_without_fractional_truncation(whole, integer, &errors)
+                    cast_with_conversion_options(whole, integer, &ConversionOptions::SAFE)
                         .unwrap()
                         .to_data(),
                     cast_with_options(whole, integer, &errors)
@@ -8030,11 +8091,13 @@ mod tests {
 
         let bounds: ArrayRef = Arc::new(Float64Array::from(vec![-128.0, 127.0]));
         let in_range =
-            cast_without_fractional_truncation(&bounds, &DataType::Int8, &errors).unwrap();
+            cast_with_conversion_options(&bounds, &DataType::Int8, &ConversionOptions::SAFE)
+                .unwrap();
         assert_eq!(in_range.as_primitive::<Int8Type>().values(), &[-128, 127]);
         let unsigned: ArrayRef = Arc::new(Float64Array::from(vec![0.0, 255.0]));
         let in_range =
-            cast_without_fractional_truncation(&unsigned, &DataType::UInt8, &errors).unwrap();
+            cast_with_conversion_options(&unsigned, &DataType::UInt8, &ConversionOptions::SAFE)
+                .unwrap();
         assert_eq!(in_range.as_primitive::<UInt8Type>().values(), &[0, 255]);
 
         let invalid: ArrayRef = Arc::new(Float64Array::from(vec![
@@ -8047,24 +8110,11 @@ mod tests {
         for index in 0..invalid.len() {
             let value = invalid.slice(index, 1);
             assert!(
-                cast_without_fractional_truncation(&value, &DataType::UInt8, &errors).is_err(),
+                cast_with_conversion_options(&value, &DataType::UInt8, &ConversionOptions::SAFE)
+                    .is_err(),
                 "{value:?} is out of UInt8 range"
             );
         }
-        assert_eq!(
-            cast_without_fractional_truncation(&invalid, &DataType::UInt8, &nulls)
-                .unwrap()
-                .to_data(),
-            cast_with_options(&invalid, &DataType::UInt8, &nulls)
-                .unwrap()
-                .to_data()
-        );
-        assert_eq!(
-            cast_without_fractional_truncation(&invalid, &DataType::UInt8, &nulls)
-                .unwrap()
-                .null_count(),
-            5
-        );
     }
 
     #[test]
@@ -8073,7 +8123,6 @@ mod tests {
             safe: false,
             ..Default::default()
         };
-        let nulls = CastOptions::default();
         let decimal = |values: Vec<Option<i128>>, scale: i8| -> ArrayRef {
             Arc::new(
                 Decimal128Array::from(values)
@@ -8084,37 +8133,34 @@ mod tests {
 
         let fraction = decimal(vec![Some(150)], 2);
         let refused =
-            cast_without_fractional_truncation(&fraction, &DataType::Int64, &errors).unwrap_err();
+            cast_with_conversion_options(&fraction, &DataType::Int64, &ConversionOptions::SAFE)
+                .unwrap_err();
         assert!(refused.to_string().contains("fraction"), "{refused}");
         let truncated = cast_with_options(&fraction, &DataType::Int64, &errors).unwrap();
         assert_eq!(truncated.as_primitive::<Int64Type>().values(), &[1]);
 
-        let mixed = decimal(vec![Some(-150), Some(-200), Some(0), None], 2);
-        let nulled = cast_without_fractional_truncation(&mixed, &DataType::Int64, &nulls).unwrap();
-        assert_eq!(
-            nulled.as_primitive::<Int64Type>(),
-            &Int64Array::from(vec![None, Some(-2), Some(0), None])
-        );
-
         let unscaled = decimal(vec![Some(7), None], 0);
         let exact =
-            cast_without_fractional_truncation(&unscaled, &DataType::Int8, &errors).unwrap();
+            cast_with_conversion_options(&unscaled, &DataType::Int8, &ConversionOptions::SAFE)
+                .unwrap();
         assert_eq!(
             exact.as_primitive::<Int8Type>(),
             &Int8Array::from(vec![Some(7), None])
         );
         let negative_scale = decimal(vec![Some(3)], -1);
-        let exact = cast_without_fractional_truncation(&negative_scale, &DataType::UInt16, &errors)
-            .unwrap();
+        let exact = cast_with_conversion_options(
+            &negative_scale,
+            &DataType::UInt16,
+            &ConversionOptions::SAFE,
+        )
+        .unwrap();
         assert_eq!(exact.as_primitive::<UInt16Type>().values(), &[30]);
 
         let out_of_range = decimal(vec![Some(25_600)], 2);
         assert!(
-            cast_without_fractional_truncation(&out_of_range, &DataType::UInt8, &errors).is_err()
+            cast_with_conversion_options(&out_of_range, &DataType::UInt8, &ConversionOptions::SAFE)
+                .is_err()
         );
-        let nulled =
-            cast_without_fractional_truncation(&out_of_range, &DataType::UInt8, &nulls).unwrap();
-        assert!(nulled.is_null(0));
 
         let decimals: [ArrayRef; 4] = [
             Arc::new(
@@ -8137,7 +8183,8 @@ mod tests {
         for fraction in &decimals {
             for integer in [DataType::Int32, DataType::UInt64] {
                 assert!(
-                    cast_without_fractional_truncation(fraction, &integer, &errors).is_err(),
+                    cast_with_conversion_options(fraction, &integer, &ConversionOptions::SAFE)
+                        .is_err(),
                     "{} to {integer} refuses 2.50",
                     fraction.data_type()
                 );
@@ -12884,7 +12931,7 @@ mod tests {
             ..Default::default()
         };
         let strict = |array: &dyn Array, to_type: &DataType| {
-            cast_without_fractional_truncation(array, to_type, &errors)
+            cast_with_conversion_options(array, to_type, &ConversionOptions::SAFE)
         };
         let int_item = Arc::new(Field::new_list_field(DataType::Int64, true));
 
@@ -13006,10 +13053,16 @@ mod tests {
                 .as_primitive::<Int64Type>(),
             &Int64Array::from(vec![Some(2), None, Some(0)])
         );
-        // The dictionary's values are cast before its keys select them, so an
-        // unused fractional value is refused as well.
+        // As Arrow C++ does, the keys select the dictionary's values before
+        // they are converted, so an unused fractional value is not refused.
         let unused = dictionary(vec![Some(1)], vec![1.5, 2.0]);
-        assert!(strict(&unused, &DataType::Int64).is_err());
+        assert_eq!(
+            strict(&unused, &DataType::Int64)
+                .unwrap()
+                .as_primitive::<Int64Type>()
+                .values(),
+            &[2]
+        );
     }
 
     #[test]

@@ -136,7 +136,7 @@ pub fn union_extract_by_type(
         target_type,
         &CastContext {
             options: cast_options,
-            refuse_fractions: false,
+            conversion: None,
         },
     )
 }

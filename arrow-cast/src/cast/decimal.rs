@@ -779,8 +779,9 @@ where
     } else {
         // A positive scale divides the fraction away, so a strict cast checks
         // the remainder first.
-        let fractional =
-            |v: D::Native| cast_options.refuse_fractions && v.mod_wrapping(div) != D::Native::ZERO;
+        let fractional = |v: D::Native| {
+            cast_options.refuse_fractions() && v.mod_wrapping(div) != D::Native::ZERO
+        };
         match cast_options.safe {
             true => {
                 for i in 0..array.len() {

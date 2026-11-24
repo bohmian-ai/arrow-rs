@@ -312,6 +312,12 @@ pub(crate) fn unpack_dictionary<K: ArrowDictionaryKeyType>(
     to_type: &DataType,
     cast_options: &CastContext,
 ) -> Result<ArrayRef, ArrowError> {
+    if cast_options.conversion.is_some() {
+        // Arrow C++ selects the values the keys reference before converting
+        // them, so an unreferenced value is never converted.
+        let values = take(array.values().as_ref(), array.keys(), None)?;
+        return cast_with_context(values.as_ref(), to_type, cast_options);
+    }
     let cast_dict_values = cast_with_context(array.values(), to_type, cast_options)?;
     take(cast_dict_values.as_ref(), array.keys(), None)
 }
