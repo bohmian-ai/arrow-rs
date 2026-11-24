@@ -8400,6 +8400,146 @@ mod tests {
         assert_eq!(binary_array.as_ref(), &expected_binary_array);
     }
 
+    /// Whether `output` holds the buffers, validity and children of `input`
+    /// itself, as Arrow C++ `CheckCastZeroCopy` asserts.
+    fn reuses_buffers(input: &dyn Array, output: &dyn Array) -> bool {
+        let input = temporal::retype(input, output.data_type().clone()).unwrap();
+        input.to_data().ptr_eq(&output.to_data())
+    }
+
+    /// Whether the byte array `output` holds the validity and value bytes of
+    /// `input`, and its offsets when they have the same width, as Arrow C++
+    /// `AssertBinaryZeroCopy` asserts.
+    fn reuses_bytes(input: &dyn Array, output: &dyn Array) -> bool {
+        let (input, output) = (input.to_data(), output.to_data());
+        let pointers = |data: &ArrayData| {
+            data.buffers()
+                .iter()
+                .map(|b| b.as_ptr())
+                .collect::<Vec<_>>()
+        };
+        let (from, to) = (pointers(&input), pointers(&output));
+        let same_nulls = input.nulls().map(|n| n.buffer().as_ptr())
+            == output.nulls().map(|n| n.buffer().as_ptr());
+        let same_values = match input.data_type() {
+            Utf8View | BinaryView => from == to,
+            _ if input.data_type().primitive_width().is_none()
+                && from.len() == 2
+                && to.len() == 2 =>
+            {
+                from[1] == to[1]
+                    && (input.buffers()[0].len() / (input.len() + 1)
+                        != output.buffers()[0].len() / (output.len() + 1)
+                        || from[0] == to[0])
+            }
+            _ => false,
+        };
+        same_nulls && same_values
+    }
+
+    /// The Arrow C++ zero copy assertions of `SameTypeZeroCopy`,
+    /// `IdentityCasts`, the temporal `ZeroCopy` tests, `BinaryOrStringToBinary`,
+    /// `StringToString` and `NoOutBitmapIfInIsAllValid`, which the PyArrow
+    /// comparison of `arrow-pyarrow-testing` cannot observe.
+    #[test]
+    fn conversion_casts_reuse_buffers() {
+        let cast = |array: &ArrayRef, to: &DataType| {
+            cast_with_conversion_options(array, to, &ConversionOptions::SAFE).unwrap()
+        };
+        let int32: ArrayRef = Arc::new(Int32Array::from(vec![Some(0), None, Some(2), Some(3)]));
+        let int64: ArrayRef = Arc::new(Int64Array::from(vec![Some(0), None, Some(2000)]));
+        let identities: Vec<ArrayRef> = vec![
+            Arc::new(NullArray::new(3)),
+            Arc::new(BooleanArray::from(vec![Some(false), Some(true), None])),
+            int32.clone(),
+            int64.clone(),
+            Arc::new(Float64Array::from(vec![Some(1.0), None])),
+            Arc::new(StringArray::from(vec!["foo", "bar"])),
+            Arc::new(BinaryArray::from(vec![b"foo".as_ref(), b"bar"])),
+            Arc::new(StringViewArray::from(vec![
+                "foo",
+                "a string longer than twelve",
+            ])),
+            Arc::new(BinaryViewArray::from(vec![b"foo".as_ref(), b"bar"])),
+            Arc::new(
+                FixedSizeBinaryArray::try_from_iter(vec![b"foo".as_ref(), b"bar"].into_iter())
+                    .unwrap(),
+            ),
+            Arc::new(ListArray::from_iter_primitive::<Int8Type, _, _>(vec![
+                Some(vec![Some(1), Some(2)]),
+                Some(vec![None]),
+                Some(vec![]),
+            ])),
+            Arc::new(Time32MillisecondArray::from(vec![1, 2])),
+            Arc::new(Time64MicrosecondArray::from(vec![1, 2])),
+            Arc::new(Date32Array::from(vec![1, 2])),
+            Arc::new(Date64Array::from(vec![86_400_000, 0])),
+            Arc::new(TimestampSecondArray::from(vec![1, 2])),
+            Arc::new(DictionaryArray::new(
+                Int8Array::from(vec![Some(0), Some(1), None, Some(0)]),
+                Arc::new(Int8Array::from(vec![1, 2])),
+            )),
+        ];
+        for array in &identities {
+            let output = cast(array, array.data_type());
+            assert!(
+                reuses_buffers(array.as_ref(), output.as_ref()),
+                "{}",
+                array.data_type()
+            );
+        }
+
+        let reinterpretations = [
+            (int64.clone(), Timestamp(TimeUnit::Second, None)),
+            (int64.clone(), Duration(TimeUnit::Second)),
+            (int64.clone(), Time64(TimeUnit::Microsecond)),
+            (int64.clone(), Date64),
+            (int32.clone(), Time32(TimeUnit::Second)),
+            (int32.clone(), Date32),
+        ];
+        for (integers, to) in reinterpretations {
+            let temporal = cast(&integers, &to);
+            assert!(reuses_buffers(integers.as_ref(), temporal.as_ref()), "{to}");
+            let back = cast(&temporal, integers.data_type());
+            assert!(
+                reuses_buffers(temporal.as_ref(), back.as_ref()),
+                "{to} back"
+            );
+        }
+        let utc: ArrayRef =
+            Arc::new(TimestampSecondArray::from(vec![0, 2000]).with_timezone("UTC"));
+        let naive = cast(&utc, &Timestamp(TimeUnit::Second, None));
+        assert!(reuses_buffers(utc.as_ref(), naive.as_ref()));
+
+        let strings: ArrayRef =
+            Arc::new(StringArray::from(vec![Some("Hi"), None, Some("olá mundo")]));
+        let large: ArrayRef = Arc::new(LargeStringArray::from(vec![Some("Hi"), None]));
+        let views: ArrayRef = Arc::new(StringViewArray::from(vec![
+            Some("Hi"),
+            None,
+            Some("a string longer than twelve"),
+        ]));
+        for (input, to) in [
+            (&strings, Binary),
+            (&strings, LargeBinary),
+            (&strings, LargeUtf8),
+            (&large, LargeBinary),
+            (&large, Binary),
+            (&large, Utf8),
+            (&views, BinaryView),
+        ] {
+            let output = cast(input, &to);
+            assert!(
+                reuses_bytes(input.as_ref(), output.as_ref()),
+                "{} to {to}",
+                input.data_type()
+            );
+        }
+
+        let all_valid: ArrayRef = Arc::new(Int8Array::from(vec![1]));
+        assert!(cast(&all_valid, &Int32).nulls().is_none());
+    }
+
     #[test]
     fn test_cast_float_to_integer_without_fractional_truncation() {
         let errors = CastOptions {
