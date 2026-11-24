@@ -17,8 +17,8 @@
 
 """The Arrow C++ cast test corpus.
 
-Translated from `cpp/src/arrow/compute/kernels/scalar_cast_test.cc` of Apache
-Arrow 24.0.0 (tag `apache-arrow-24.0.0`, commit
+Translated from `cpp/src/arrow/compute/kernels/scalar_cast_test.cc` and the
+cast tests of `cpp/src/arrow/scalar_test.cc` of Apache Arrow 24.0.0 (tag `apache-arrow-24.0.0`, commit
 `31b4b6c0a0a7e7c117312d285541a21446675ec6`), licensed to the Apache Software
 Foundation under the Apache License, Version 2.0. Each `@cpp_test` function
 translates the C++ test of the same name; its cases keep the C++ inputs,
@@ -35,6 +35,17 @@ import json
 
 import numpy as np
 import pyarrow as pa
+
+# Every cast TEST of `cpp/src/arrow/scalar_test.cc` at the pinned commit, in
+# source order: scalar casts through the same cast function.
+SCALAR_CPP_TESTS = """
+TestNullScalar.Cast TestBooleanScalar.Cast TestScalar.IdentityCast
+TestDecimalScalar.Cast TestBinaryScalar.Cast TestFixedSizeBinaryScalar.Cast
+TestDateScalars.MakeScalar TestTimeScalars.MakeScalar TestTimestampScalars.Cast
+TestNumericScalar.Cast TestListLikeScalar.Cast TestFixedSizeListScalar.Cast
+TestMapScalar.Cast TestStructScalar.Cast TestDictionaryScalar.Cast
+TestUnionScalar.Cast
+""".split()
 
 # Every TEST in scalar_cast_test.cc at the pinned commit, in source order.
 CPP_TESTS = """
@@ -70,11 +81,19 @@ PrimitiveToExtension ExtensionDictToExtension IntToExtensionTypeDowncast
 DictTypeToAnotherDict NoOutBitmapIfInIsAllValid
 """.split()
 
+SCALAR_TO_STRING = (
+    "no Rust equivalent: the test asserts only C++ Scalar::CastTo to utf8, "
+    "which formats Scalar::ToString outside the cast function, as the test "
+    "itself notes"
+)
+
 # C++ tests whose assertions are not cast outcomes, and the Rust test owning
 # the equivalent assertion.
 MAPPED_ELSEWHERE = {
     "SameTypeZeroCopy": "arrow-cast cast::tests::conversion_casts_reuse_buffers",
     "NoOutBitmapIfInIsAllValid": "arrow-cast cast::tests::conversion_casts_reuse_buffers",
+    "TestStructScalar.Cast": SCALAR_TO_STRING,
+    "TestUnionScalar.Cast": SCALAR_TO_STRING,
     "CastDoesNotProvideDefaultOptions": (
         "the signature of cast_with_conversion_options, which takes "
         "&ConversionOptions, so no call can omit them"
@@ -1497,6 +1516,149 @@ def _():
     yield fails(array, pa.dictionary(pa.int8(), pa.int8()))
 
 
+def scalar(input, expected=None, to=None, expect=None, **options):
+    """A scalar cast of the one value of `input`, as the C++ `Scalar` tests
+    call the cast function. `expected` is the cast result, or `expect` the
+    refusal category when it is `None`."""
+    to = expected.type if expected is not None else to
+    return Case(input, to, options, expected if expected is not None else expect, "scalar", variants="scalars")
+
+
+@cpp_test("TestNullScalar.Cast")
+def _():
+    # The C++ test casts with Scalar::CastTo, since the cast function refuses a
+    # null scalar; the cast function's null array casts are compared here.
+    for to in [pa.int8(), pa.float64(), pa.date32(), pa.time32("s"), pa.timestamp("s"), pa.duration("s"), pa.utf8(), pa.large_binary(), pa.list_(pa.int32()), pa.struct([pa.field("f", pa.int32())]), pa.map_(pa.utf8(), pa.int32()), pa.decimal128(12, 2), pa.list_view(pa.int32()), pa.large_list(pa.int32()), pa.dense_union([pa.field("string", pa.utf8()), pa.field("number", pa.uint64())]), pa.sparse_union([pa.field("string", pa.utf8()), pa.field("number", pa.uint64())])]:
+        yield attempt(pa.nulls(1), to)
+
+
+@cpp_test("TestBooleanScalar.Cast")
+def _():
+    for b in [True, False]:
+        value = pa.array([b])
+        yield scalar(value, value)
+        for to in [pa.int8(), pa.uint16(), pa.int32(), pa.uint64(), pa.float32(), pa.float64()]:
+            yield scalar(value, pa.array([int(b)], to))
+        yield scalar(value, pa.array(["true" if b else "false"]))
+
+
+@cpp_test("TestScalar.IdentityCast")
+def _():
+    # `IntervalTypes()` day_time and month intervals, which PyArrow cannot
+    # construct, are `cast::tests::conversion_casts_reuse_buffers` identities.
+    values = [(pa.null(), [None]), (pa.bool_(), [True]), (pa.date32(), [1]), (pa.date64(), [86400000])]
+    values += [(type, [3]) for type in INTEGER + [pa.float32(), pa.float64()]]
+    values += [(type, ["foo"]) for type in BASE_BINARY + [pa.string_view(), pa.binary_view()]]
+    values += [(type, [1]) for type in [pa.time32("s"), pa.time32("ms"), pa.time64("us"), pa.time64("ns")]]
+    values += [(pa.timestamp(unit), [1]) for unit in UNITS] + [(pa.duration(unit), [1]) for unit in UNITS]
+    values += [(pa.month_day_nano_interval(), [pa.MonthDayNano([1, 2, 3])])]
+    values += [(pa.list_(pa.int32(), 20), [list(range(20))]), (pa.list_(pa.int32()), [[1, 2]]), (pa.large_list(pa.int32()), [[1, 2]])]
+    for type, value in values:
+        array = pa.array(value, type)
+        yield scalar(array, array)
+
+
+@cpp_test("TestDecimalScalar.Cast")
+def _():
+    for type in [pa.decimal32(3, 2), pa.decimal64(3, 2), pa.decimal128(3, 2), pa.decimal256(3, 2)]:
+        yield scalar(decimal_unscaled(type, [314]), pa.array(["3.14"]))
+
+
+@cpp_test("TestBinaryScalar.Cast")
+def _():
+    yield scalar(pa.array([b"test data"]), pa.array(["test data"]))
+
+
+@cpp_test("TestFixedSizeBinaryScalar.Cast")
+def _():
+    yield scalar(pa.array([b"test data"], pa.binary(9)), pa.array(["test data"]))
+
+
+@cpp_test("TestDateScalars.MakeScalar")
+def _():
+    for type in [pa.date32(), pa.date64()]:
+        yield scalar(pa.array([5], type), pa.array([5], type))
+
+
+@cpp_test("TestTimeScalars.MakeScalar")
+def _():
+    for type in [pa.time32("s"), pa.time32("ms"), pa.time64("us"), pa.time64("ns")]:
+        yield scalar(pa.array([5], type), pa.array([5], type))
+
+
+@cpp_test("TestTimestampScalars.Cast")
+def _():
+    for unit_in, unit_out, value, result in [("s", "ms", 1, 1000), ("s", "ns", 1, 1000000000), ("ns", "us", 1234, 1), ("us", "ms", 4567, 4)]:
+        yield scalar(pa.array([value], pa.timestamp(unit_in)), pa.array([result], pa.timestamp(unit_out)), **UNSAFE)
+    millis = pa.array([1024], pa.timestamp("ms"))
+    yield scalar(millis, pa.array(["1970-01-01 00:00:01.024"]))
+    yield scalar(millis, pa.array([1024], pa.int64()))
+    day = 86400000
+    yield scalar(pa.array([1024 * day + 3], pa.timestamp("ms")), pa.array([1024 * day], pa.date64()))
+
+
+@cpp_test("TestNumericScalar.Cast")
+def _():
+    for type in [pa.uint8(), pa.uint16(), pa.uint32(), pa.uint64(), pa.int8(), pa.int16(), pa.int32(), pa.int64(), pa.float32(), pa.float64(), pa.float16()]:
+        for repr in ["0", "1", "3"]:
+            value = pa.array([repr]).cast(type)
+            for other_type in [pa.float32(), pa.int8(), pa.int64(), pa.uint32()]:
+                other = pa.array([repr]).cast(other_type)
+                yield scalar(value, other)
+                yield scalar(other, value)
+            yield scalar(pa.array([repr]), value)
+            if pa.types.is_integer(type):
+                yield scalar(value, pa.array([repr]))
+
+
+def _list_scalar_casts(value, from_type, invalid):
+    """C++ `CheckListCast` of the list scalar of `value` to a list, large list
+    and fixed size list of its length, and `CheckListCastError` to `invalid`."""
+    array = pa.array([value.to_pylist()], from_type)
+    item = value.type
+    for to in [pa.list_(item), pa.large_list(item), pa.list_(item, len(value))]:
+        yield scalar(array, pa.array([value.to_pylist()], to))
+    category = "TypeError" if pa.types.is_fixed_size_list(from_type) else "Invalid"
+    yield scalar(array, to=invalid, expect=category)
+
+
+@cpp_test("TestListLikeScalar.Cast")
+def _():
+    # These cases execute as scalars only, as the C++ test does: Arrow C++
+    # 24.0.0 casts a list view array to a list with too short an offsets
+    # buffer, and refuses its cast to a fixed size list of the list's size.
+    value = J(pa.int16(), "[1, 2, null]")
+    for from_type in [pa.list_(pa.int16()), pa.large_list(pa.int16()), pa.list_view(pa.int16()), pa.large_list_view(pa.int16()), pa.list_(pa.int16(), 3)]:
+        yield from _list_scalar_casts(value, from_type, pa.list_(pa.int16(), 5))
+
+
+@cpp_test("TestFixedSizeListScalar.Cast")
+def _():
+    yield from _list_scalar_casts(J(pa.int16(), "[1, 2, 5]"), pa.list_(pa.int16(), 3), pa.list_(pa.int16(), 4))
+
+
+@cpp_test("TestMapScalar.Cast")
+def _():
+    key_value = pa.struct([pa.field("key", pa.utf8(), False), pa.field("value", pa.int8())])
+    entries = [("a", 1), ("b", 2)]
+    array = pa.array([entries], pa.map_(pa.utf8(), pa.int8()))
+    value = [{"key": k, "value": v} for k, v in entries]
+    for to in [pa.list_(key_value), pa.large_list(key_value), pa.list_(key_value, 2)]:
+        yield scalar(array, pa.array([value], to))
+    yield scalar(array, to=pa.list_(key_value, 5), expect="Invalid")
+
+
+@cpp_test("TestDictionaryScalar.Cast")
+def _():
+    for index_type in INTEGER:
+        for value_type in [pa.utf8(), pa.large_utf8(), pa.binary(), pa.large_binary()]:
+            dictionary = J(value_type, '["alpha", null, "gamma"]')
+            for i in range(len(dictionary)):
+                # The C++ test asserts the decoded value; the dictionary
+                # itself may differ.
+                yield scalar(dictionary.slice(i, 1), to=pa.dictionary(index_type, value_type))
+
+
 # One type of every Arrow C++ type id PyArrow can construct, in C++ id order.
 REGISTRATION_TYPES = [
     pa.null(), pa.bool_(), *INTEGER, pa.float16(), pa.float32(), pa.float64(),
@@ -1535,6 +1697,6 @@ def unmapped_tests():
     translated = {name for name, _ in _REGISTRY}
     return [
         name
-        for name in CPP_TESTS
+        for name in CPP_TESTS + SCALAR_CPP_TESTS
         if name not in translated and name not in MAPPED_ELSEWHERE and name not in LIMITATIONS
     ]

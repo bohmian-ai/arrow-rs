@@ -81,7 +81,8 @@ def variants(case):
     """Yield `(variant, input array, reference outcome)` for every execution of `case`."""
     array = case.input
     options = cast_options(case)
-    yield ("array", array, outcome(lambda: pc.cast(array, options=options)))
+    if case.variants != "scalars":
+        yield ("array", array, outcome(lambda: pc.cast(array, options=options)))
     if not case.variants:
         return
     for index in range(len(array)):
@@ -91,6 +92,8 @@ def variants(case):
             as_scalar_array(scalar),
             outcome(lambda: as_scalar_array(scalar.cast(options=options))),
         )
+    if case.variants == "scalars":
+        return
     third = len(array) // 3
     slices = []
     if third > 0:

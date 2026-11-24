@@ -8440,7 +8440,8 @@ mod tests {
     /// The Arrow C++ zero copy assertions of `SameTypeZeroCopy`,
     /// `IdentityCasts`, the temporal `ZeroCopy` tests, `BinaryOrStringToBinary`,
     /// `StringToString` and `NoOutBitmapIfInIsAllValid`, which the PyArrow
-    /// comparison of `arrow-pyarrow-testing` cannot observe.
+    /// comparison of `arrow-pyarrow-testing` cannot observe, and the
+    /// `TestScalar.IdentityCast` interval types PyArrow cannot construct.
     #[test]
     fn conversion_casts_reuse_buffers() {
         let cast = |array: &ArrayRef, to: &DataType| {
@@ -8475,6 +8476,8 @@ mod tests {
             Arc::new(Date32Array::from(vec![1, 2])),
             Arc::new(Date64Array::from(vec![86_400_000, 0])),
             Arc::new(TimestampSecondArray::from(vec![1, 2])),
+            Arc::new(IntervalYearMonthArray::from(vec![1, 2])),
+            Arc::new(IntervalDayTimeArray::from(vec![IntervalDayTime::new(1, 2)])),
             Arc::new(DictionaryArray::new(
                 Int8Array::from(vec![Some(0), Some(1), None, Some(0)]),
                 Arc::new(Int8Array::from(vec![1, 2])),

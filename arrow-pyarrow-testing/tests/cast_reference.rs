@@ -19,8 +19,9 @@
 //! cast operation on identical inputs.
 //!
 //! `cast_reference/corpus.py` translates the C++ cast tests of
-//! `cpp/src/arrow/compute/kernels/scalar_cast_test.cc` at Apache Arrow
-//! 24.0.0 (commit `31b4b6c0a0a7e7c117312d285541a21446675ec6`), and
+//! `cpp/src/arrow/compute/kernels/scalar_cast_test.cc` and the scalar cast
+//! tests of `cpp/src/arrow/scalar_test.cc` at Apache Arrow 24.0.0 (commit
+//! `31b4b6c0a0a7e7c117312d285541a21446675ec6`), and
 //! `cast_reference/harness.py` executes each case through PyArrow 24.0.0. The
 //! input of every execution crosses the C Data Interface unchanged, so slice
 //! offsets, unreferenced dictionary values and the children of null parents
