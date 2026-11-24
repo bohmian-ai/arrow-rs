@@ -894,6 +894,102 @@ def _():
         yield check(J(pa.bool_(), "[true, null, false, false, true]"), J(to, "[1, null, 0, 0, 1]"))
 
 
+@cpp_test("UnsupportedInputType")
+def _():
+    yield unsupported(J(pa.int32(), "[1, 2, 3]"), pa.list_(pa.utf8()))
+
+
+@cpp_test("UnsupportedTargetType")
+def _():
+    yield unsupported(J(pa.int32(), "[1, 2, 3]"), pa.dense_union([pa.field("a", pa.int32())]))
+
+
+@cpp_test("StringToBoolean")
+def _():
+    for string_type in [pa.utf8(), pa.large_utf8()]:
+        yield check(J(string_type, '["False", null, "true", "True", "false"]'), J(pa.bool_(), "[false, null, true, true, false]"))
+        yield check(J(string_type, '["0", null, "1", "1", "0"]'), J(pa.bool_(), "[false, null, true, true, false]"))
+        yield fails(J(string_type, '["false "]'), pa.bool_())
+        yield fails(J(string_type, '["T"]'), pa.bool_())
+
+
+@cpp_test("StringToInt")
+def _():
+    for string_type in [pa.utf8(), pa.large_utf8()]:
+        for signed_type in [pa.int8(), pa.int16(), pa.int32(), pa.int64()]:
+            yield check(J(string_type, '["0", null, "127", "-1", "0", "0x0", "0x7F"]'), J(signed_type, "[0, null, 127, -1, 0, 0, 127]"))
+        yield check(
+            J(string_type, '["2147483647", null, "-2147483648", "0", "0X0", "0x7FFFFFFF", "0XFFFFfFfF", "0Xf0000000"]'),
+            J(pa.int32(), "[2147483647, null, -2147483648, 0, 0, 2147483647, -1, -268435456]"),
+        )
+        yield check(
+            J(string_type, '["9223372036854775807", null, "-9223372036854775808", "0", "0x0", "0x7FFFFFFFFFFFFFFf", "0XF000000000000001"]'),
+            J(pa.int64(), "[9223372036854775807, null, -9223372036854775808, 0, 0, 9223372036854775807, -1152921504606846975]"),
+        )
+        for unsigned_type in [pa.uint8(), pa.uint16(), pa.uint32(), pa.uint64()]:
+            yield check(J(string_type, '["0", null, "127", "255", "0", "0X0", "0xff", "0x7f"]'), J(unsigned_type, "[0, null, 127, 255, 0, 0, 255, 127]"))
+        yield check(
+            J(string_type, '["2147483647", null, "4294967295", "0", "0x0", "0x7FFFFFFf", "0xFFFFFFFF"]'),
+            J(pa.uint32(), "[2147483647, null, 4294967295, 0, 0, 2147483647, 4294967295]"),
+        )
+        yield check(
+            J(string_type, '["9223372036854775807", null, "18446744073709551615", "0", "0x0", "0x7FFFFFFFFFFFFFFf", "0xfFFFFFFFFFFFFFFf"]'),
+            J(pa.uint64(), "[9223372036854775807, null, 18446744073709551615, 0, 0, 9223372036854775807, 18446744073709551615]"),
+        )
+        for not_int8 in ["z", "12 z", "128", "-129", "0.5", "0x", "0xfff", "-0xf0"]:
+            yield fails(J(string_type, [not_int8]), pa.int8())
+        for not_uint8 in ["256", "-1", "0.5", "0x", "0x3wa", "0x123"]:
+            yield fails(J(string_type, [not_uint8]), pa.uint8())
+
+
+@cpp_test("StringToFloating")
+def _():
+    # The C++ test repeats the cast under a French locale; Rust parsing has
+    # no locale.
+    for string_type in [pa.utf8(), pa.large_utf8()]:
+        for float_type in [pa.float32(), pa.float64()]:
+            yield check(J(string_type, '["0.1", null, "127.3", "1e3", "200.4", "0.5"]'), J(float_type, "[0.1, null, 127.3, 1000, 200.4, 0.5]"))
+            yield fails(J(string_type, '["z"]'), pa.float32())
+
+
+@cpp_test("StringToDecimal")
+def _():
+    for string_type in [pa.utf8(), pa.large_utf8()]:
+        for decimal_type in DECIMALS_5_2:
+            yield check(J(string_type, '["0.01", null, "127.32", "200.43", "0.54"]'), J(decimal_type, '["0.01", null, "127.32", "200.43", "0.54"]'))
+            yield fails(J(string_type, '["z"]'), pa.decimal128(5, 2))
+
+
+@cpp_test("StringToTimestamp")
+def _():
+    for string_type in [pa.utf8(), pa.large_utf8()]:
+        strings = J(string_type, '["1970-01-01", null, "2000-02-29"]')
+        yield check(strings, J(pa.timestamp("s"), "[0, null, 951782400]"))
+        yield check(strings, J(pa.timestamp("us"), "[0, null, 951782400000000]"))
+        for unit in UNITS:
+            for not_ts in ["", "xxx"]:
+                yield fails(J(string_type, [not_ts]), pa.timestamp(unit))
+        zoned = J(string_type, '["2020-02-29T00:00:00Z", "2020-03-02T10:11:12+0102"]')
+        mixed = J(string_type, '["2020-03-02T10:11:12+0102", "2020-02-29T00:00:00"]')
+        yield fails(zoned, pa.timestamp("s"))
+        yield fails(mixed, pa.timestamp("s"))
+        yield fails(mixed, pa.timestamp("s", "UTC"))
+        yield fails(strings, pa.timestamp("s", "UTC"))
+        yield check(zoned, J(pa.timestamp("s", "UTC"), "[1582934400, 1583140152]"))
+        yield check(zoned, J(pa.timestamp("s", "America/Phoenix"), "[1582934400, 1583140152]"))
+
+
+@cpp_test("StringToDate")
+def _():
+    for string_type in [pa.utf8(), pa.large_utf8()]:
+        strings = J(string_type, '["1970-01-01", null, "2000-02-29"]')
+        yield check(strings, J(pa.date32(), "[0, null, 11016]"))
+        yield check(strings, J(pa.date64(), "[0, null, 951782400000]"))
+        for date_type in [pa.date32(), pa.date64()]:
+            for not_date in ["", "2012-01-xx", "2012-01-01 09:00:00"]:
+                yield fails(J(string_type, [not_date]), date_type)
+
+
 # One type of every Arrow C++ type id PyArrow can construct, in C++ id order.
 REGISTRATION_TYPES = [
     pa.null(), pa.bool_(), *INTEGER, pa.float16(), pa.float32(), pa.float64(),

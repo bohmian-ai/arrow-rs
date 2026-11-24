@@ -517,7 +517,7 @@ pub(crate) fn conversion_to_fixed_size_binary(
 }
 
 /// The values of a string or binary array as bytes.
-fn byte_values(array: &dyn Array) -> Box<dyn Iterator<Item = Option<&[u8]>> + '_> {
+pub(crate) fn byte_values(array: &dyn Array) -> Box<dyn Iterator<Item = Option<&[u8]>> + '_> {
     match array.data_type() {
         DataType::Utf8 => Box::new(
             array
@@ -581,7 +581,7 @@ fn parse_cpp_boolean(s: &[u8]) -> Option<bool> {
 /// Arrow C++ integer parsing: a `0x` literal of at most twice the type's
 /// byte width in hexadecimal digits, whose bits are reinterpreted for a
 /// signed type, or an optional `-` and decimal digits within range.
-fn parse_cpp_integer<N: NumCast>(s: &[u8]) -> Option<N> {
+pub(crate) fn parse_cpp_integer<N: NumCast>(s: &[u8]) -> Option<N> {
     let bits = 8 * std::mem::size_of::<N>() as u32;
     let signed = <N as NumCast>::from(-1).is_some();
     if s.len() > 2 && s[0] == b'0' && (s[1] == b'x' || s[1] == b'X') {
@@ -922,5 +922,180 @@ fn adjust_integer_string_with_scale(scale: i32, out: &mut String) {
         let zeros: String = std::iter::repeat_n('0', (scale - digits + 2) as usize).collect();
         out.insert_str(negative, &zeros);
         out.replace_range(negative + 1..negative + 2, ".");
+    }
+}
+
+/// The value of the two to four ASCII digits `s`, as Arrow C++ `ParseUnsigned`
+/// reads a fixed width field.
+fn fixed_digits(s: &[u8]) -> Option<u32> {
+    s.iter().try_fold(0u32, |value, digit| {
+        digit
+            .is_ascii_digit()
+            .then(|| value * 10 + (digit - b'0') as u32)
+    })
+}
+
+/// Arrow C++ `ParseYYYY_MM_DD` of the first ten bytes of `s`: days since
+/// 1970-01-01 of a valid proleptic Gregorian date.
+fn parse_cpp_date(s: &[u8]) -> Option<i64> {
+    use chrono::Datelike;
+    if s.len() < 10 || s[4] != b'-' || s[7] != b'-' {
+        return None;
+    }
+    let date = chrono::NaiveDate::from_ymd_opt(
+        fixed_digits(&s[0..4])? as i32,
+        fixed_digits(&s[5..7])?,
+        fixed_digits(&s[8..10])?,
+    )?;
+    Some(date.num_days_from_ce() as i64 - 719_163)
+}
+
+/// Arrow C++ `ParseHH`, `ParseHH_MM`, `ParseHHMM` and `ParseHH_MM_SS`: the
+/// seconds of an `hh`, `hh:mm`, `hhmm` or `hh:mm:ss` field.
+fn parse_cpp_clock(s: &[u8]) -> Option<i64> {
+    let field = |range: std::ops::Range<usize>, limit| {
+        fixed_digits(&s[range]).filter(|value| *value < limit)
+    };
+    let (hours, minutes, seconds) = match s.len() {
+        2 => (field(0..2, 24)?, 0, 0),
+        4 => (field(0..2, 24)?, field(2..4, 60)?, 0),
+        5 if s[2] == b':' => (field(0..2, 24)?, field(3..5, 60)?, 0),
+        8 if s[2] == b':' && s[5] == b':' => (field(0..2, 24)?, field(3..5, 60)?, field(6..8, 60)?),
+        _ => return None,
+    };
+    Some(hours as i64 * 3600 + minutes as i64 * 60 + seconds as i64)
+}
+
+/// Arrow C++ `ParseTimestampISO8601`: the instant in `unit` of a
+/// `YYYY-MM-DD[( |T)hh[:mm[:ss[.s{1,9}]]]][Z|(+|-)hh[[:]mm]]` string, and
+/// whether it carries a zone offset. Fractional seconds may have at most the
+/// digits of `unit`.
+fn parse_cpp_timestamp(s: &[u8], unit: &TimeUnit) -> Option<(i64, bool)> {
+    let per_second = per_second(unit);
+    let date = parse_cpp_date(s)?;
+    if s.len() == 10 {
+        return Some(((date * 86_400).checked_mul(per_second)?, false));
+    }
+    if s[10] != b' ' && s[10] != b'T' {
+        return None;
+    }
+    let mut length = s.len();
+    let mut offset = 0;
+    let mut zoned = false;
+    let sign_at =
+        |position: usize| length >= position && matches!(s[length - position], b'+' | b'-');
+    if s[length - 1] == b'Z' {
+        length -= 1;
+        zoned = true;
+    } else if sign_at(3) || sign_at(5) || (sign_at(6) && s[length - 3] == b':') {
+        let width = if sign_at(3) {
+            3
+        } else if sign_at(5) {
+            5
+        } else {
+            6
+        };
+        length -= width;
+        offset = parse_cpp_clock(&s[length + 1..length + width])?;
+        if s[length] == b'+' {
+            offset = -offset;
+        }
+        zoned = true;
+    }
+    let clock = match length {
+        13 | 16 | 19 => parse_cpp_clock(&s[11..length])?,
+        21..=29 => parse_cpp_clock(&s[11..19])?,
+        _ => return None,
+    };
+    let seconds = (clock + offset).checked_add(date * 86_400)?;
+    let mut value = seconds.checked_mul(per_second)?;
+    if length > 19 {
+        let fraction = &s[20..length];
+        let digits = per_second.ilog10() as usize;
+        if s[19] != b'.' || fraction.len() > digits {
+            return None;
+        }
+        let subseconds =
+            fixed_digits(fraction)? as i64 * 10_i64.pow((digits - fraction.len()) as u32);
+        value = value.checked_add(subseconds)?;
+    }
+    Some((value, zoned))
+}
+
+/// Parses strings to timestamps of `unit` as Arrow C++ does: ISO 8601 with a
+/// zone offset exactly when the target has a time zone.
+///
+/// # Errors
+///
+/// Returns [`ArrowError::CastError`] for the first string that does not parse
+/// or whose zone offset presence does not match the target.
+pub(crate) fn conversion_parse_timestamp(
+    array: &dyn Array,
+    to_type: &DataType,
+) -> Result<ArrayRef, ArrowError> {
+    let DataType::Timestamp(unit, tz) = to_type else {
+        unreachable!("only called for timestamp targets")
+    };
+    let expect_zone = tz.is_some();
+    let values = byte_values(array)
+        .map(|value| {
+            value
+                .map(|s| {
+                    let error = |detail: &str| {
+                        ArrowError::CastError(format!(
+                            "Failed to parse string: '{}' as a scalar of type {to_type}{detail}",
+                            String::from_utf8_lossy(s)
+                        ))
+                    };
+                    let (value, zoned) = parse_cpp_timestamp(s, unit).ok_or_else(|| error(""))?;
+                    match (zoned, expect_zone) {
+                        (false, true) => Err(error(": expected a zone offset")),
+                        (true, false) => Err(error(": expected no zone offset")),
+                        _ => Ok(value),
+                    }
+                })
+                .transpose()
+        })
+        .collect::<Result<PrimitiveArray<Int64Type>, _>>()?;
+    retype(&values, to_type.clone())
+}
+
+/// Parses `YYYY-MM-DD` strings to dates as Arrow C++ does.
+///
+/// # Errors
+///
+/// Returns [`ArrowError::CastError`] for the first string that is not exactly
+/// a valid date.
+pub(crate) fn conversion_parse_date(
+    array: &dyn Array,
+    to_type: &DataType,
+) -> Result<ArrayRef, ArrowError> {
+    let scale = if matches!(to_type, DataType::Date64) {
+        86_400_000
+    } else {
+        1
+    };
+    let values = byte_values(array)
+        .map(|value| {
+            value
+                .map(|s| {
+                    (s.len() == 10)
+                        .then(|| parse_cpp_date(s))
+                        .flatten()
+                        .map(|days| days * scale)
+                        .ok_or_else(|| {
+                            ArrowError::CastError(format!(
+                                "Failed to parse string: '{}' as a scalar of type {to_type}",
+                                String::from_utf8_lossy(s)
+                            ))
+                        })
+                })
+                .transpose()
+        })
+        .collect::<Result<PrimitiveArray<Int64Type>, _>>()?;
+    if scale == 1 {
+        retype(&values.unary::<_, Int32Type>(|v| v as i32), to_type.clone())
+    } else {
+        retype(&values, to_type.clone())
     }
 }

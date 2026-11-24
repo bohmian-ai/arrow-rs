@@ -963,36 +963,193 @@ where
                 v.div_wrapping(multiplier)
             }
         } else {
-            let rescaled = if delta < 0 {
-                (v.mod_wrapping(multiplier) == W::ZERO).then(|| v.div_wrapping(multiplier))
-            } else {
-                let product = v.mul_wrapping(multiplier);
-                let overflowed = if v.is_lt(W::ZERO) {
-                    product.is_gt(v)
-                } else {
-                    product.is_lt(v)
-                };
-                (!overflowed).then_some(product)
-            };
-            let rescaled = rescaled.ok_or_else(|| {
-                ArrowError::CastError(format!(
-                    "Rescaling decimal value {v:?} from scale {in_scale} to scale {scale} would cause data loss"
-                ))
-            })?;
-            let magnitude = if rescaled.is_lt(W::ZERO) {
-                rescaled.neg_wrapping()
-            } else {
-                rescaled
-            };
-            if !magnitude.is_lt(bound) {
+            checked_rescale(
+                v,
+                delta,
+                multiplier,
+                bound,
+                in_scale as i32,
+                scale,
+                precision,
+            )?
+        };
+        Ok::<_, ArrowError>(O::Native::wrap(v.widen()))
+    })?;
+    Ok(Arc::new(result.with_precision_and_scale(precision, scale)?))
+}
+
+/// Arrow C++ `Rescale` followed by `FitsInPrecision`: `v` multiplied or
+/// divided by `multiplier`, ten to the power of `|delta|`, refused when that
+/// loses digits or wraps, or when the result is not below `bound`, ten to the
+/// power of `precision`.
+///
+/// # Errors
+///
+/// Returns [`ArrowError::CastError`] for a value that loses digits or does not
+/// fit `precision`.
+fn checked_rescale<W: WrappingDecimal>(
+    v: W,
+    delta: i32,
+    multiplier: W,
+    bound: W,
+    in_scale: i32,
+    scale: i8,
+    precision: u8,
+) -> Result<W, ArrowError> {
+    let rescaled = if delta < 0 {
+        (v.mod_wrapping(multiplier) == W::ZERO).then(|| v.div_wrapping(multiplier))
+    } else {
+        let product = v.mul_wrapping(multiplier);
+        let overflowed = if v.is_lt(W::ZERO) {
+            product.is_gt(v)
+        } else {
+            product.is_lt(v)
+        };
+        (!overflowed).then_some(product)
+    };
+    let rescaled = rescaled.ok_or_else(|| {
+        ArrowError::CastError(format!(
+            "Rescaling decimal value {v:?} from scale {in_scale} to scale {scale} would cause data loss"
+        ))
+    })?;
+    let magnitude = if rescaled.is_lt(W::ZERO) {
+        rescaled.neg_wrapping()
+    } else {
+        rescaled
+    };
+    if !magnitude.is_lt(bound) {
+        return Err(ArrowError::CastError(format!(
+            "Decimal value {rescaled:?} does not fit in precision {precision}"
+        )));
+    }
+    Ok(rescaled)
+}
+
+/// Parses strings and binary values to the decimal type `D` as Arrow C++
+/// `Decimal*::FromString` and its cast kernel do: an optional sign, digits
+/// with an optional fraction, and an optional exponent, accumulated with
+/// wrapping in the width of `D` (refused beyond the signed range for Decimal32
+/// and Decimal64), then rescaled to `scale`. Without `allow_decimal_truncate`
+/// a value that loses digits or does not fit `precision` is refused; with it
+/// the value is rescaled with wrapping multiplication or truncating division.
+///
+/// # Errors
+///
+/// Returns [`ArrowError::CastError`] for the first value refused.
+pub(crate) fn conversion_parse_decimal<D>(
+    array: &dyn Array,
+    precision: u8,
+    scale: i8,
+    conversion: &ConversionOptions,
+) -> Result<ArrayRef, ArrowError>
+where
+    D: DecimalType,
+    D::Native: WrappingDecimal,
+{
+    let ten = D::Native::usize_as(10);
+    let bound = ten.pow_wrapping(precision as u32);
+    let narrow = D::BYTE_LENGTH <= 8;
+    let parse = |text: &[u8]| -> Result<D::Native, ArrowError> {
+        let invalid = || {
+            ArrowError::CastError(format!(
+                "The string '{}' is not a valid {} number",
+                String::from_utf8_lossy(text),
+                D::PREFIX
+            ))
+        };
+        let (negative, rest) = match text.first() {
+            Some(b'-') => (true, &text[1..]),
+            Some(b'+') => (false, &text[1..]),
+            Some(_) => (false, text),
+            None => return Err(invalid()),
+        };
+        let digits_run = |s: &[u8]| s.iter().take_while(|c| c.is_ascii_digit()).count();
+        let whole = digits_run(rest);
+        let (whole_digits, mut rest) = rest.split_at(whole);
+        let mut fraction_digits: &[u8] = &[];
+        let mut exponent = 0;
+        if !rest.is_empty() {
+            if rest[0] == b'.' {
+                let fraction = digits_run(&rest[1..]);
+                fraction_digits = &rest[1..1 + fraction];
+                rest = &rest[1 + fraction..];
+            }
+            if whole_digits.is_empty() && fraction_digits.is_empty() {
+                return Err(invalid());
+            }
+            if !rest.is_empty() {
+                if rest[0] != b'e' && rest[0] != b'E' {
+                    return Err(invalid());
+                }
+                let mut digits = &rest[1..];
+                if digits.first() == Some(&b'+') {
+                    digits = &digits[1..];
+                }
+                exponent = parse_cpp_integer::<i32>(digits).ok_or_else(invalid)?;
+            }
+        } else if whole_digits.is_empty() {
+            return Err(invalid());
+        }
+        let digits = whole_digits.iter().chain(fraction_digits);
+        let mut value = if narrow {
+            let wide = digits.fold(0u64, |v, d| {
+                v.wrapping_mul(10).wrapping_add((d - b'0') as u64)
+            });
+            let max = D::Native::MAX_TOTAL_ORDER.as_usize() as u64;
+            if wide > max {
                 return Err(ArrowError::CastError(format!(
-                    "Decimal value {rescaled:?} does not fit in precision {precision}"
+                    "The string '{}' cannot be represented as {}",
+                    String::from_utf8_lossy(text),
+                    D::PREFIX
                 )));
             }
-            rescaled
+            D::Native::usize_as(wide as usize)
+        } else {
+            digits.fold(D::Native::ZERO, |v, d| {
+                v.mul_wrapping(ten)
+                    .add_wrapping(D::Native::usize_as((d - b'0') as usize))
+            })
         };
-        Ok(O::Native::wrap(v.widen()))
-    })?;
+        if negative {
+            value = value.neg_wrapping();
+        }
+        let mut parsed_scale = fraction_digits.len() as i32 - exponent;
+        if parsed_scale < 0 {
+            if -parsed_scale > D::MAX_SCALE as i32 {
+                return Err(ArrowError::CastError(format!(
+                    "The string '{}' cannot be represented as {}",
+                    String::from_utf8_lossy(text),
+                    D::PREFIX
+                )));
+            }
+            value = value.mul_wrapping(ten.pow_wrapping((-parsed_scale) as u32));
+            parsed_scale = 0;
+        }
+        let delta = scale as i32 - parsed_scale;
+        // ponytail: Arrow C++ reads past its power of ten table for a
+        // rescale beyond the maximum scale; this wraps instead.
+        let multiplier = ten.pow_wrapping(delta.unsigned_abs());
+        if conversion.allow_decimal_truncate {
+            Ok(if delta > 0 {
+                value.mul_wrapping(multiplier)
+            } else {
+                value.div_wrapping(multiplier)
+            })
+        } else {
+            checked_rescale(
+                value,
+                delta,
+                multiplier,
+                bound,
+                parsed_scale,
+                scale,
+                precision,
+            )
+        }
+    };
+    let result = byte_values(array)
+        .map(|value| value.map(parse).transpose())
+        .collect::<Result<PrimitiveArray<D>, _>>()?;
     Ok(Arc::new(result.with_precision_and_scale(precision, scale)?))
 }
 

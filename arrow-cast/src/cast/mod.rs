@@ -1098,6 +1098,36 @@ pub(crate) fn cast_with_context(
             Utf8 | LargeUtf8 | Utf8View | Binary | LargeBinary | BinaryView,
             FixedSizeBinary(width),
         ) if cast_options.conversion.is_some() => conversion_to_fixed_size_binary(array, *width),
+        (Utf8 | LargeUtf8, Timestamp(..)) if cast_options.conversion.is_some() => {
+            conversion_parse_timestamp(array, to_type)
+        }
+        (Utf8 | LargeUtf8, Date32 | Date64) if cast_options.conversion.is_some() => {
+            conversion_parse_date(array, to_type)
+        }
+        (
+            Utf8 | LargeUtf8 | Utf8View | Binary | LargeBinary | BinaryView,
+            Decimal32(..) | Decimal64(..) | Decimal128(..) | Decimal256(..),
+        ) if cast_options.conversion.is_some() => {
+            let conversion = cast_options
+                .conversion
+                .as_ref()
+                .expect("guarded by the arm");
+            match to_type {
+                Decimal32(p, s) => {
+                    conversion_parse_decimal::<Decimal32Type>(array, *p, *s, conversion)
+                }
+                Decimal64(p, s) => {
+                    conversion_parse_decimal::<Decimal64Type>(array, *p, *s, conversion)
+                }
+                Decimal128(p, s) => {
+                    conversion_parse_decimal::<Decimal128Type>(array, *p, *s, conversion)
+                }
+                Decimal256(p, s) => {
+                    conversion_parse_decimal::<Decimal256Type>(array, *p, *s, conversion)
+                }
+                _ => unreachable!("guarded by the arm"),
+            }
+        }
         (RunEndEncoded(index_type, _), _) => match index_type.data_type() {
             Int16 => run_end_encoded_cast::<Int16Type>(array, to_type, cast_options),
             Int32 => run_end_encoded_cast::<Int32Type>(array, to_type, cast_options),
