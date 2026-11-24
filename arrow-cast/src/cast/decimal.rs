@@ -820,6 +820,182 @@ where
     Ok(Arc::new(value_builder.finish()))
 }
 
+/// A decimal native type whose wrapping arithmetic Arrow C++ uses as the
+/// working width of a decimal to decimal conversion.
+trait WrappingDecimal: ArrowNativeTypeOp {
+    /// The value, sign extended.
+    fn widen(self) -> i256;
+    /// The low bits of `value`.
+    fn wrap(value: i256) -> Self;
+}
+
+impl WrappingDecimal for i32 {
+    fn widen(self) -> i256 {
+        i256::from_i128(self as i128)
+    }
+    fn wrap(value: i256) -> Self {
+        value.as_i128() as i32
+    }
+}
+
+impl WrappingDecimal for i64 {
+    fn widen(self) -> i256 {
+        i256::from_i128(self as i128)
+    }
+    fn wrap(value: i256) -> Self {
+        value.as_i128() as i64
+    }
+}
+
+impl WrappingDecimal for i128 {
+    fn widen(self) -> i256 {
+        i256::from_i128(self)
+    }
+    fn wrap(value: i256) -> Self {
+        value.as_i128()
+    }
+}
+
+impl WrappingDecimal for i256 {
+    fn widen(self) -> i256 {
+        self
+    }
+    fn wrap(value: i256) -> Self {
+        value
+    }
+}
+
+/// Converts decimals to the decimal type `to_type` as Arrow C++ does.
+///
+/// Arrow C++ computes in a working width chosen by the pair of types: the
+/// target width for Decimal32 and Decimal256 targets, the wider of the two
+/// otherwise. An input wider than the working width keeps its low bits, and
+/// the result keeps the low bits of the working value. Without
+/// `allow_decimal_truncate` a value that loses digits when rescaled or does
+/// not fit the target precision is refused; with it the value is rescaled
+/// with wrapping multiplication or truncating division.
+///
+/// # Errors
+///
+/// Returns [`ArrowError::CastError`] for the first value refused.
+pub(crate) fn conversion_decimal_to_decimal(
+    array: &dyn Array,
+    to_type: &DataType,
+    cast_options: &CastContext,
+) -> Result<ArrayRef, ArrowError> {
+    use DataType::*;
+    let conversion = cast_options
+        .conversion
+        .as_ref()
+        .expect("the dispatcher routes only conversion casts here");
+    match (array.data_type(), to_type) {
+        (_, Decimal256(p, s)) => rescale_from::<Decimal256Type, i256>(array, *p, *s, conversion),
+        (_, Decimal32(p, s)) => rescale_from::<Decimal32Type, i32>(array, *p, *s, conversion),
+        (Decimal32(..) | Decimal64(..), Decimal64(p, s)) => {
+            rescale_from::<Decimal64Type, i64>(array, *p, *s, conversion)
+        }
+        (Decimal128(..), Decimal64(p, s)) => {
+            rescale_from::<Decimal64Type, i128>(array, *p, *s, conversion)
+        }
+        (Decimal256(..), Decimal64(p, s)) => {
+            rescale_from::<Decimal64Type, i256>(array, *p, *s, conversion)
+        }
+        (Decimal256(..), Decimal128(p, s)) => {
+            rescale_from::<Decimal128Type, i256>(array, *p, *s, conversion)
+        }
+        (_, Decimal128(p, s)) => rescale_from::<Decimal128Type, i128>(array, *p, *s, conversion),
+        _ => unreachable!("the dispatcher routes only decimal to decimal casts here"),
+    }
+}
+
+fn rescale_from<O, W>(
+    array: &dyn Array,
+    precision: u8,
+    scale: i8,
+    conversion: &ConversionOptions,
+) -> Result<ArrayRef, ArrowError>
+where
+    O: DecimalType,
+    O::Native: WrappingDecimal,
+    W: WrappingDecimal,
+{
+    match array.data_type() {
+        DataType::Decimal32(_, s) => {
+            rescale::<Decimal32Type, O, W>(array.as_primitive(), *s, precision, scale, conversion)
+        }
+        DataType::Decimal64(_, s) => {
+            rescale::<Decimal64Type, O, W>(array.as_primitive(), *s, precision, scale, conversion)
+        }
+        DataType::Decimal128(_, s) => {
+            rescale::<Decimal128Type, O, W>(array.as_primitive(), *s, precision, scale, conversion)
+        }
+        DataType::Decimal256(_, s) => {
+            rescale::<Decimal256Type, O, W>(array.as_primitive(), *s, precision, scale, conversion)
+        }
+        other => unreachable!("{other} is not a decimal type"),
+    }
+}
+
+fn rescale<I, O, W>(
+    array: &PrimitiveArray<I>,
+    in_scale: i8,
+    precision: u8,
+    scale: i8,
+    conversion: &ConversionOptions,
+) -> Result<ArrayRef, ArrowError>
+where
+    I: DecimalType,
+    I::Native: WrappingDecimal,
+    O: DecimalType,
+    O::Native: WrappingDecimal,
+    W: WrappingDecimal,
+{
+    let ten = W::wrap(i256::from_i128(10));
+    let delta = scale as i32 - in_scale as i32;
+    let multiplier = ten.pow_wrapping(delta.unsigned_abs());
+    let bound = ten.pow_wrapping(precision as u32);
+    let result = array.try_unary::<_, O, _>(|v| {
+        let v = W::wrap(v.widen());
+        let v = if conversion.allow_decimal_truncate {
+            if delta > 0 {
+                v.mul_wrapping(multiplier)
+            } else {
+                v.div_wrapping(multiplier)
+            }
+        } else {
+            let rescaled = if delta < 0 {
+                (v.mod_wrapping(multiplier) == W::ZERO).then(|| v.div_wrapping(multiplier))
+            } else {
+                let product = v.mul_wrapping(multiplier);
+                let overflowed = if v.is_lt(W::ZERO) {
+                    product.is_gt(v)
+                } else {
+                    product.is_lt(v)
+                };
+                (!overflowed).then_some(product)
+            };
+            let rescaled = rescaled.ok_or_else(|| {
+                ArrowError::CastError(format!(
+                    "Rescaling decimal value {v:?} from scale {in_scale} to scale {scale} would cause data loss"
+                ))
+            })?;
+            let magnitude = if rescaled.is_lt(W::ZERO) {
+                rescaled.neg_wrapping()
+            } else {
+                rescaled
+            };
+            if !magnitude.is_lt(bound) {
+                return Err(ArrowError::CastError(format!(
+                    "Decimal value {rescaled:?} does not fit in precision {precision}"
+                )));
+            }
+            rescaled
+        };
+        Ok(O::Native::wrap(v.widen()))
+    })?;
+    Ok(Arc::new(result.with_precision_and_scale(precision, scale)?))
+}
+
 /// Converts decimals to integers as Arrow C++ does.
 ///
 /// Without `allow_decimal_truncate` a value is rescaled to scale zero and

@@ -1066,10 +1066,17 @@ pub(crate) fn cast_with_context(
     if from_type == to_type {
         return Ok(make_array(array.to_data()));
     }
-    if cast_options.conversion.is_some() && !cpp_registered(from_type, to_type) {
-        return Err(ArrowError::NotYetImplemented(format!(
-            "Unsupported cast from {from_type} to {to_type}"
-        )));
+    if cast_options.conversion.is_some() {
+        if !cpp_registered(from_type, to_type) {
+            return Err(ArrowError::NotYetImplemented(format!(
+                "Unsupported cast from {from_type} to {to_type}"
+            )));
+        }
+        // Arrow C++ does not run a registered kernel on an empty input, so
+        // none of its checks refuse one.
+        if array.is_empty() {
+            return Ok(new_empty_array(to_type));
+        }
     }
     match (from_type, to_type) {
         (Null, _) => Ok(new_null_array(to_type, array.len())),
@@ -1257,6 +1264,12 @@ pub(crate) fn cast_with_context(
         // Map
         (Map(_, ordered1), Map(_, ordered2)) if ordered1 == ordered2 => {
             cast_map_values(array.as_map(), to_type, cast_options, ordered1.to_owned())
+        }
+        (
+            Decimal32(..) | Decimal64(..) | Decimal128(..) | Decimal256(..),
+            Decimal32(..) | Decimal64(..) | Decimal128(..) | Decimal256(..),
+        ) if cast_options.conversion.is_some() => {
+            conversion_decimal_to_decimal(array, to_type, cast_options)
         }
         // Decimal to decimal, same width
         (Decimal32(p1, s1), Decimal32(p2, s2)) => {

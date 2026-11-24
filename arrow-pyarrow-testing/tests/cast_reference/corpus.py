@@ -454,6 +454,109 @@ def _():
     yield from _wide_decimal_to_int(pa.decimal128)
 
 
+@cpp_test("Decimal256ToInt")
+def _():
+    t = pa.decimal256(40, 10)
+    for overflow in [False, True]:
+        for truncate in [False, True]:
+            o = dict(allow_int_overflow=overflow, allow_decimal_truncate=truncate)
+            yield check(J(t, '["02.0000000000", "-11.0000000000", "22.0000000000", "-121.0000000000", null]'), J(pa.int64(), "[2, -11, 22, -121, null]"), **o)
+    for overflow in [False, True]:
+        a = J(t, '["02.1000000000", "-11.0000004500", "22.0000004500", "-121.1210000000", null]')
+        yield check(a, J(pa.int64(), "[2, -11, 22, -121, null]"), allow_int_overflow=overflow, allow_decimal_truncate=True)
+        yield fails(a, pa.int64(), allow_int_overflow=overflow, allow_decimal_truncate=False)
+    for truncate in [False, True]:
+        a = J(t, '["1234567890123456789000000.0000000000", "9999999999999999999999999.0000000000", null]')
+        yield check(a, J(pa.int64(), "[1096246371337547584, 1590897978359414783, null]"), allow_int_overflow=True, allow_decimal_truncate=truncate)
+        yield fails(a, pa.int64(), allow_int_overflow=False, allow_decimal_truncate=truncate)
+    for overflow in [False, True]:
+        for truncate in [False, True]:
+            o = dict(allow_int_overflow=overflow, allow_decimal_truncate=truncate)
+            a = J(t, '["1234567890123456789000000.0045345000", "9999999999999999999999999.0000344300", null]')
+            if overflow and truncate:
+                yield check(a, J(pa.int64(), "[1096246371337547584, 1590897978359414783, null]"), **o)
+            else:
+                yield fails(a, pa.int64(), **o)
+    negative_scale = decimal_unscaled(pa.decimal256(40, -4), [123456789, -12])
+    yield check(negative_scale, J(pa.int64(), "[1234567890000, -120000]"), allow_int_overflow=True, allow_decimal_truncate=True)
+
+
+@cpp_test("IntegerToDecimal")
+def _():
+    for decimal_type in [pa.decimal32(9, 2), pa.decimal64(18, 2), pa.decimal128(22, 2), pa.decimal256(22, 2)]:
+        for integer_type in INTEGER:
+            if decimal_type.bit_width > integer_type.bit_width:
+                yield check(J(integer_type, "[0, 7, null, 100, 99]"), J(decimal_type, '["0.00", "7.00", null, "100.00", "99.00"]'))
+    for decimal_type in [pa.decimal128(19, 0), pa.decimal256(19, 0)]:
+        yield check(J(pa.int64(), [-9223372036854775808, 9223372036854775807]), J(decimal_type, '["-9223372036854775808", "9223372036854775807"]'))
+    for decimal_type in [pa.decimal128(20, 0), pa.decimal256(20, 0)]:
+        yield check(J(pa.uint64(), [0, 18446744073709551615]), J(decimal_type, '["0", "18446744073709551615"]'))
+    yield fails(J(pa.int32(), "[0]"), pa.decimal32(9, 3))
+    yield fails(J(pa.int64(), "[0]"), pa.decimal64(18, 3))
+    yield fails(J(pa.int8(), "[0]"), pa.decimal128(5, 3))
+    yield fails(J(pa.int32(), "[0]"), pa.decimal256(76, 67))
+
+
+def _fraction(scale, whole):
+    return f"{whole}.{'1234567890'[:scale]}"
+
+
+def _decimal_to_decimal(no_truncation, small, truncation, whole, invalid, both_directions):
+    """The shared body of the C++ `DecimalNToDecimalM` tests, given each
+    test's types: `(from, to)` pairs for the exact conversions, the
+    truncating pair and its whole-number round trip, and the `(from, to
+    constructor)` of the conversions that overflow the target precision."""
+    for truncate in [False, True]:
+        a = J(no_truncation[0], "[2, 30, 22, -121, null]")
+        b = J(no_truncation[1], "[2, 30, 22, -121, null]")
+        yield check(a, b, allow_decimal_truncate=truncate)
+        if both_directions:
+            yield check(b, a, allow_decimal_truncate=truncate)
+    for truncate in [False, True]:
+        for from_type, to in small:
+            a = J(from_type, '["12.34", "0.56"]')
+            b = J(to, '["12.34", "0.56"]')
+            yield check(a, b, allow_decimal_truncate=truncate)
+            if both_directions:
+                yield check(b, a, allow_decimal_truncate=truncate)
+    from_type, to = truncation
+    fractional = J(from_type, [_fraction(from_type.scale, "-02"), _fraction(from_type.scale, "30"), None])
+    truncated = J(to, '["-2", "30", null]')
+    whole_from, whole_to = whole
+    yield check(fractional, truncated, allow_decimal_truncate=True)
+    yield check(J(whole_from, '["-2", "30", null]'), J(whole_to, '["-2", "30", null]'), allow_decimal_truncate=True)
+    yield fails(fractional, to, allow_decimal_truncate=False)
+    yield check(J(whole_from, '["-2", "30", null]'), J(whole_to, '["-2", "30", null]'), allow_decimal_truncate=False)
+    invalid_from, invalid_to = invalid
+    a = J(invalid_from(4, 2), '["12.34"]')
+    for precision, scale in [(3, 2), (4, 3), (2, 1)]:
+        # C++ expects a result that fails validation; it is compared as is.
+        yield attempt(a, invalid_to(precision, scale), "overflows precision", allow_decimal_truncate=True)
+        yield fails(a, invalid_to(precision, scale), allow_decimal_truncate=False)
+
+
+d32, d64, d128, d256 = pa.decimal32, pa.decimal64, pa.decimal128, pa.decimal256
+for _name, _arguments in {
+    "Decimal32ToDecimal32": ((d32(9, 5), d32(9, 0)), [(d32(5, 2), d32(4, 2))], (d32(9, 5), d32(6, 0)), (d32(6, 0), d32(9, 5)), (d32, d32), True),
+    "Decimal64ToDecimal64": ((d64(18, 10), d64(9, 0)), [(d64(5, 2), d64(4, 2))], (d64(18, 10), d64(12, 0)), (d64(12, 0), d64(18, 10)), (d64, d64), True),
+    "Decimal128ToDecimal128": ((d128(38, 10), d128(28, 0)), [(d128(5, 2), d128(4, 2))], (d128(38, 10), d128(28, 0)), (d128(28, 0), d128(38, 10)), (d128, d128), True),
+    "Decimal256ToDecimal256": ((d256(38, 10), d256(28, 0)), [(d256(5, 2), d256(4, 2))], (d256(38, 10), d256(28, 0)), (d256(28, 0), d256(38, 10)), (d256, d256), True),
+    "Decimal32ToDecimal64": ((d32(9, 5), d64(16, 0)), [(d32(5, 2), d64(4, 2)), (d32(5, 2), d64(16, 2))], (d32(7, 5), d64(14, 0)), (d32(9, 0), d64(18, 10)), (d32, d64), False),
+    "Decimal32ToDecimal128": ((d32(9, 5), d128(16, 0)), [(d32(5, 2), d128(4, 2)), (d32(5, 2), d128(16, 2))], (d32(7, 5), d128(14, 0)), (d32(9, 0), d128(38, 10)), (d32, d128), False),
+    "Decimal32ToDecimal256": ((d32(9, 5), d256(16, 0)), [(d32(5, 2), d256(4, 2)), (d32(5, 2), d256(16, 2))], (d32(7, 5), d256(14, 0)), (d32(9, 0), d256(76, 10)), (d32, d256), False),
+    "Decimal64ToDecimal32": ((d64(18, 5), d32(9, 0)), [(d64(12, 2), d32(4, 2))], (d64(15, 5), d32(6, 0)), (d64(12, 0), d32(9, 5)), (d64, d32), False),
+    "Decimal64ToDecimal128": ((d64(18, 10), d128(28, 0)), [(d64(5, 2), d128(4, 2)), (d64(5, 2), d128(16, 2))], (d64(16, 10), d128(14, 0)), (d64(18, 0), d128(38, 10)), (d64, d128), False),
+    "Decimal64ToDecimal256": ((d64(18, 10), d256(16, 0)), [(d64(5, 2), d256(4, 2)), (d64(5, 2), d256(16, 2))], (d64(16, 10), d256(14, 0)), (d64(18, 0), d256(76, 10)), (d64, d256), False),
+    "Decimal128ToDecimal32": ((d128(26, 5), d32(9, 0)), [(d128(28, 2), d32(4, 2))], (d128(28, 5), d32(7, 0)), (d128(22, 0), d32(9, 5)), (d128, d32), False),
+    "Decimal128ToDecimal64": ((d128(26, 10), d64(15, 0)), [(d128(28, 2), d64(4, 2))], (d128(28, 10), d64(12, 0)), (d128(22, 0), d64(18, 10)), (d128, d64), False),
+    "Decimal128ToDecimal256": ((d128(38, 10), d256(48, 0)), [(d128(5, 2), d256(4, 2)), (d128(5, 2), d256(40, 2))], (d128(38, 10), d256(28, 0)), (d128(28, 0), d256(38, 10)), (d128, d256), False),
+    "Decimal256ToDecimal32": ((d256(42, 5), d32(9, 0)), [(d256(42, 2), d32(4, 2))], (d256(52, 5), d32(7, 0)), (d256(42, 0), d32(9, 5)), (d256, d32), False),
+    "Decimal256ToDecimal64": ((d256(42, 10), d64(15, 0)), [(d256(42, 2), d64(4, 2))], (d256(52, 10), d64(12, 0)), (d256(42, 0), d64(18, 10)), (d256, d64), False),
+    "Decimal256ToDecimal128": ((d256(42, 10), d128(28, 0)), [(d256(42, 2), d128(4, 2))], (d256(52, 10), d128(28, 0)), (d256(42, 0), d128(38, 10)), (d256, d128), False),
+}.items():
+    cpp_test(_name)(lambda _arguments=_arguments: _decimal_to_decimal(*_arguments))
+
+
 # One type of every Arrow C++ type id PyArrow can construct, in C++ id order.
 REGISTRATION_TYPES = [
     pa.null(), pa.bool_(), *INTEGER, pa.float16(), pa.float32(), pa.float64(),
