@@ -728,6 +728,9 @@ where
     <D as ArrowPrimitiveType>::Native: ToPrimitive,
 {
     let array = array.as_primitive::<D>();
+    if let Some(conversion) = &cast_options.conversion {
+        return conversion_decimal_to_integer::<D, T>(array, base, scale, conversion);
+    }
 
     let div: D::Native = base.pow_checked(scale.unsigned_abs() as u32).map_err(|_| {
         ArrowError::CastError(format!(
@@ -777,20 +780,16 @@ where
             }
         }
     } else {
-        // A positive scale divides the fraction away, so a strict cast checks
-        // the remainder first.
-        let fractional = |v: D::Native| {
-            cast_options.refuse_fractions() && v.mod_wrapping(div) != D::Native::ZERO
-        };
         match cast_options.safe {
             true => {
                 for i in 0..array.len() {
                     if array.is_null(i) {
                         value_builder.append_null();
                     } else {
-                        let v = Some(array.value(i))
-                            .filter(|v| !fractional(*v))
-                            .and_then(|v| v.div_checked(div).ok())
+                        let v = array
+                            .value(i)
+                            .div_checked(div)
+                            .ok()
                             .and_then(<T::Native as NumCast>::from::<D::Native>);
                         value_builder.append_option(v);
                     }
@@ -801,14 +800,7 @@ where
                     if array.is_null(i) {
                         value_builder.append_null();
                     } else {
-                        let v = array.value(i);
-                        if fractional(v) {
-                            return Err(ArrowError::CastError(format!(
-                                "Can't cast value {v:?} with scale {scale} to type {} without truncating its fraction",
-                                T::DATA_TYPE
-                            )));
-                        }
-                        let v = v.div_checked(div)?;
+                        let v = array.value(i).div_checked(div)?;
 
                         let value =
                             <T::Native as NumCast>::from::<D::Native>(v).ok_or_else(|| {
@@ -826,6 +818,70 @@ where
         }
     }
     Ok(Arc::new(value_builder.finish()))
+}
+
+/// Converts decimals to integers as Arrow C++ does.
+///
+/// Without `allow_decimal_truncate` a value is rescaled to scale zero and
+/// refused when that loses digits or overflows; with it a positive scale
+/// divides the fraction away and a negative scale multiplies with wrapping.
+/// The integer is then refused outside the target range unless
+/// `allow_int_overflow`, which keeps its low bits instead.
+///
+/// # Errors
+///
+/// Returns [`ArrowError::CastError`] for the first value that loses digits or
+/// does not fit the target.
+fn conversion_decimal_to_integer<D, T>(
+    array: &PrimitiveArray<D>,
+    base: D::Native,
+    scale: i8,
+    conversion: &ConversionOptions,
+) -> Result<ArrayRef, ArrowError>
+where
+    T: ArrowPrimitiveType,
+    T::Native: NumCast,
+    D: DecimalType + ArrowPrimitiveType,
+    D::Native: ToPrimitive,
+{
+    let multiplier = base.pow_wrapping(scale.unsigned_abs() as u32);
+    let rescale = |v: D::Native| -> Result<D::Native, ArrowError> {
+        let lost = || {
+            ArrowError::CastError(format!(
+                "Rescaling decimal value {v:?} with scale {scale} would cause data loss"
+            ))
+        };
+        if scale > 0 {
+            let whole = v.div_wrapping(multiplier);
+            if !conversion.allow_decimal_truncate && v.mod_wrapping(multiplier) != D::Native::ZERO {
+                return Err(lost());
+            }
+            Ok(whole)
+        } else {
+            let whole = v.mul_wrapping(multiplier);
+            let overflowed = if v.is_lt(D::Native::ZERO) {
+                whole.is_gt(v)
+            } else {
+                whole.is_lt(v)
+            };
+            if !conversion.allow_decimal_truncate && overflowed {
+                return Err(lost());
+            }
+            Ok(whole)
+        }
+    };
+    let result = array.try_unary::<_, T, _>(|v| {
+        let whole = rescale(v)?;
+        match <T::Native as NumCast>::from::<D::Native>(whole) {
+            Some(value) => Ok(value),
+            None if conversion.allow_int_overflow => Ok(T::Native::usize_as(whole.as_usize())),
+            None => Err(ArrowError::CastError(format!(
+                "Integer value {whole:?} not in range of {}",
+                T::DATA_TYPE
+            ))),
+        }
+    })?;
+    Ok(Arc::new(result))
 }
 
 /// Cast a decimal array to a floating point array.

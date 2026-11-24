@@ -894,14 +894,6 @@ pub(crate) struct CastContext<'a> {
     pub(crate) conversion: Option<ConversionOptions>,
 }
 
-impl CastContext<'_> {
-    /// Whether a float or decimal with a nonzero fraction fails to convert to
-    /// an integer instead of being truncated.
-    pub(crate) fn refuse_fractions(&self) -> bool {
-        self.conversion.is_some_and(|c| !c.allow_float_truncate)
-    }
-}
-
 impl<'a> std::ops::Deref for CastContext<'a> {
     type Target = CastOptions<'a>;
 
@@ -2679,14 +2671,11 @@ fn cast_numeric_arrays<FROM, TO>(
 where
     FROM: ArrowPrimitiveType,
     TO: ArrowPrimitiveType,
-    FROM::Native: NumCast,
+    FROM::Native: NumCast + AsPrimitive<TO::Native>,
     TO::Native: NumCast,
 {
-    if cast_options.refuse_fractions()
-        && FROM::DATA_TYPE.is_floating()
-        && TO::DATA_TYPE.is_integer()
-    {
-        return integral_numeric_cast::<FROM, TO>(from.as_primitive::<FROM>(), cast_options.safe);
+    if let Some(conversion) = &cast_options.conversion {
+        return conversion_numeric_cast::<FROM, TO>(from.as_primitive::<FROM>(), conversion);
     }
     if cast_options.safe {
         // If the value can't be casted to the `TO::Native`, return null
@@ -2701,46 +2690,112 @@ where
     }
 }
 
-/// Cast floating point `from` to integer type `R`, treating a finite value
-/// with a nonzero fraction as a failed conversion: `NULL` when `safe`, else an
-/// error. Other values convert as [`num_cast`] converts them.
-fn integral_numeric_cast<T, R>(from: &PrimitiveArray<T>, safe: bool) -> Result<ArrayRef, ArrowError>
+/// Cast `from` to `R` as the Arrow C++ numeric cast kernels do under
+/// `conversion`: values convert as C++ `static_cast` converts them (half
+/// floats through `f32`), and unless permitted, a valid integer that does
+/// not fit an integer target, a float that does not convert to an integer
+/// exactly, or an integer beyond the exactly representable range of a float
+/// target is refused. A null slot's value is never checked.
+///
+/// A float outside the range of an integer target converts saturating, where
+/// C++ `static_cast` is undefined.
+fn conversion_numeric_cast<T, R>(
+    from: &PrimitiveArray<T>,
+    conversion: &ConversionOptions,
+) -> Result<ArrayRef, ArrowError>
 where
     T: ArrowPrimitiveType,
     R: ArrowPrimitiveType,
-    T::Native: NumCast,
+    T::Native: NumCast + AsPrimitive<R::Native>,
     R::Native: NumCast,
 {
-    // Every supported float widens to f64 exactly, so its fraction is exact.
-    let fractional = |value: T::Native| {
-        value
-            .to_f64()
-            .is_some_and(|v| v.is_finite() && v.fract() != 0.0)
-    };
-    if safe {
-        return Ok(Arc::new(from.unary_opt::<_, R>(|value| {
-            if fractional(value) {
-                None
-            } else {
-                num_cast::<T::Native, R::Native>(value)
+    let check: Option<Box<dyn Fn(T::Native, R::Native) -> Result<(), ArrowError>>> =
+        match (T::DATA_TYPE.is_integer(), R::DATA_TYPE.is_integer()) {
+            (true, true) if !conversion.allow_int_overflow => {
+                Some(Box::new(|value: T::Native, _| {
+                    match num_cast::<T::Native, R::Native>(value) {
+                        Some(_) => Ok(()),
+                        None => Err(ArrowError::CastError(format!(
+                            "Integer value {value:?} not in range: {} to {}",
+                            integer_bound::<R>(false),
+                            integer_bound::<R>(true),
+                        ))),
+                    }
+                }))
             }
-        })));
-    }
+            (false, true) if !conversion.allow_float_truncate => {
+                Some(Box::new(|value: T::Native, out: R::Native| {
+                    if value.to_f64() == out.to_f64() {
+                        Ok(())
+                    } else {
+                        Err(ArrowError::CastError(format!(
+                            "Float value {value:?} was truncated converting to {}",
+                            R::DATA_TYPE
+                        )))
+                    }
+                }))
+            }
+            (true, false) if !conversion.allow_float_truncate => {
+                integer_to_float_bound(&T::DATA_TYPE, &R::DATA_TYPE).map(|limit| {
+                    let lower = if T::DATA_TYPE.is_signed_integer() {
+                        -limit
+                    } else {
+                        0
+                    };
+                    Box::new(move |value: T::Native, _| {
+                        let value = value.to_i128().expect("an integer widens to i128");
+                        if (lower..=limit).contains(&value) {
+                            Ok(())
+                        } else {
+                            Err(ArrowError::CastError(format!(
+                                "Integer value {value} not in range: {lower} to {limit}"
+                            )))
+                        }
+                    })
+                        as Box<dyn Fn(T::Native, R::Native) -> Result<(), ArrowError>>
+                })
+            }
+            _ => None,
+        };
+    let Some(check) = check else {
+        return Ok(Arc::new(from.unary::<_, R>(|value| value.as_())));
+    };
     Ok(Arc::new(from.try_unary::<_, R, _>(|value| {
-        if fractional(value) {
-            return Err(ArrowError::CastError(format!(
-                "Can't cast value {value:?} to type {} without truncating its fraction",
-                R::DATA_TYPE
-            )));
-        }
-        num_cast::<T::Native, R::Native>(value).ok_or_else(|| {
-            ArrowError::CastError(format!(
-                "Can't cast value {:?} to type {}",
-                value,
-                R::DATA_TYPE
-            ))
-        })
+        let out = value.as_();
+        check(value, out).map(|_| out)
     })?))
+}
+
+/// The bound `limit` of Arrow C++ `CheckForIntegerToFloatingTruncation`: a
+/// cast of integer type `from` to float type `to` is exact for values in
+/// `-limit..=limit`, or `None` when every value of `from` is exact.
+fn integer_to_float_bound(from: &DataType, to: &DataType) -> Option<i128> {
+    use DataType::*;
+    match (from, to) {
+        (Int8 | Int16 | UInt8 | UInt16, _) | (Int32 | UInt32, Float64) => None,
+        (Int32 | UInt32, _) | (Int64 | UInt64, Float32) => Some(1 << 24),
+        _ => Some(1 << 53),
+    }
+}
+
+/// The smallest or largest value of integer type `R`.
+fn integer_bound<R: ArrowPrimitiveType>(max: bool) -> i128 {
+    use DataType::*;
+    match (R::DATA_TYPE, max) {
+        (Int8, false) => i8::MIN.into(),
+        (Int8, true) => i8::MAX.into(),
+        (Int16, false) => i16::MIN.into(),
+        (Int16, true) => i16::MAX.into(),
+        (Int32, false) => i32::MIN.into(),
+        (Int32, true) => i32::MAX.into(),
+        (Int64, false) => i64::MIN.into(),
+        (Int64, true) => i64::MAX.into(),
+        (UInt8, true) => u8::MAX.into(),
+        (UInt16, true) => u16::MAX.into(),
+        (UInt32, true) => u32::MAX.into(),
+        (UInt64, true) => u64::MAX.into(),
+        _ => 0,
+    }
 }
 
 // Natural cast between numeric types
@@ -8027,7 +8082,7 @@ mod tests {
         let refused =
             cast_with_conversion_options(&fraction, &DataType::Int64, &ConversionOptions::SAFE)
                 .unwrap_err();
-        assert!(refused.to_string().contains("fraction"), "{refused}");
+        assert!(refused.to_string().contains("was truncated"), "{refused}");
         let truncated = cast_with_options(&fraction, &DataType::Int64, &errors).unwrap();
         assert_eq!(truncated.as_primitive::<Int64Type>().values(), &[1]);
 
@@ -8135,7 +8190,7 @@ mod tests {
         let refused =
             cast_with_conversion_options(&fraction, &DataType::Int64, &ConversionOptions::SAFE)
                 .unwrap_err();
-        assert!(refused.to_string().contains("fraction"), "{refused}");
+        assert!(refused.to_string().contains("data loss"), "{refused}");
         let truncated = cast_with_options(&fraction, &DataType::Int64, &errors).unwrap();
         assert_eq!(truncated.as_primitive::<Int64Type>().values(), &[1]);
 
