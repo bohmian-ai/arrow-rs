@@ -146,7 +146,8 @@ def executions():
     types, option flags, reference status, reference result, reference
     message, any disagreement with the C++ test's expectation, and the
     approved exception that lets Rust refuse as `Invalid` where Arrow C++
-    converts, if the case has one. A field carries an extension type as
+    converts, if the case has one, and the exact result it lets Rust return
+    instead, if any. A field carries an extension type as
     its metadata, which the C Data Interface keeps and the array drops."""
     for test, number, case in corpus.cases():
         flags = {flag: bool(case.options.get(flag, False)) for flag in FLAGS}
@@ -169,6 +170,7 @@ def executions():
                 str(value) if kind != "ok" else "",
                 translation,
                 case.exception,
+                case.exception_result,
             )
 
 

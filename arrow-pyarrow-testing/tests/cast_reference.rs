@@ -59,6 +59,7 @@ type Execution<'py> = (
     String,
     Option<String>,
     Option<String>,
+    Option<Bound<'py, PyAny>>,
 );
 
 /// The Arrow C++ status category a Rust cast error corresponds to.
@@ -165,9 +166,14 @@ fn identity_mismatch(
 }
 
 /// Whether a difference is the one an approved exception permits: Arrow C++
-/// converts and Rust refuses as `Invalid`.
-fn excepted(rust: &Result<ArrayData, ArrowError>, kind: &str) -> bool {
-    kind == "ok" && matches!(rust, Err(error) if category(error) == "Invalid")
+/// converts and Rust refuses as `Invalid` or, when the exception names an
+/// `approved` result, returns exactly that result.
+fn excepted(rust: &Result<ArrayData, ArrowError>, kind: &str, approved: Option<&ArrayData>) -> bool {
+    kind == "ok"
+        && match approved {
+            Some(approved) => rust.is_ok() && mismatch(rust, "ok", Some(approved), "").is_none(),
+            None => matches!(rust, Err(error) if category(error) == "Invalid"),
+        }
 }
 
 #[test]
@@ -191,7 +197,7 @@ fn cast_matches_arrow_cpp_reference() {
 
         for execution in harness.call_method0("executions")?.try_iter()? {
             let execution = execution?;
-            let (test, case, variant, input, (from_field, to_field, result_field), flags, kind, result, message, translation, exception): Execution =
+            let (test, case, variant, input, (from_field, to_field, result_field), flags, kind, result, message, translation, exception, approved): Execution =
                 execution.extract()?;
             executions += 1;
             let input = ArrayData::from_pyarrow_bound(&input)?;
@@ -201,6 +207,9 @@ fn cast_matches_arrow_cpp_reference() {
             let options = conversion_options(&flags)?;
             let reference = result
                 .map(|result| ArrayData::from_pyarrow_bound(&result))
+                .transpose()?;
+            let approved = approved
+                .map(|approved| ArrayData::from_pyarrow_bound(&approved))
                 .transpose()?;
             let result_field = result_field
                 .map(|field| Field::from_pyarrow_bound(&field))
@@ -214,7 +223,7 @@ fn cast_matches_arrow_cpp_reference() {
             };
             let mut difference = mismatch(&rust, &kind, reference.as_ref(), &message)
                 .or_else(|| identity_mismatch(&rust, &to_field, result_field.as_ref()));
-            let permitted = exception.is_some() && difference.is_some() && excepted(&rust, &kind);
+            let permitted = exception.is_some() && difference.is_some() && excepted(&rust, &kind, approved.as_ref());
             if permitted {
                 exceptions.push(format!("{case} [{variant}] to {to}"));
                 difference = None;

@@ -123,6 +123,7 @@ class Case:
         self.label = label
         self.variants = variants
         self.exception = None
+        self.exception_result = None
 
 
 def check(input, expected, label="", **options):
@@ -153,12 +154,33 @@ INVALID_UTF8_STRINGS = (
 )
 
 
-def excepted(input, to, label, reason, **options):
-    """A C++ cast for which an approved exception lets Rust refuse as
-    `Invalid` where Arrow C++ converts, for `reason`. Any other difference is
-    still a disagreement."""
-    case = Case(input, to, options, None, label)
+# Why approved exceptions of revision 14 let Rust differ from Arrow C++.
+NON_NULLABLE_NULLS = (
+    "approved exception: Arrow C++ converts to a non-nullable child holding "
+    "nulls, which a Rust array cannot soundly hold, so Rust refuses"
+)
+UNDEFINED_DECIMAL64_SHIFT = (
+    "approved exception: Arrow C++ shifts a 64-bit word by 64 or more bits, "
+    "which is undefined, so Rust returns the correctly rounded value"
+)
+UNREPRESENTABLE_LOCAL_TIME = (
+    "approved exception: Arrow C++ wraps a local day beyond 32 bits or a zone "
+    "offset beyond the calendar range, so Rust refuses"
+)
+BUNDLED_ZONES = (
+    "approved exception: Rust resolves zones through its bundled database, "
+    "which has no host zone such as localtime, so Rust refuses"
+)
+
+
+def excepted(input, to, label, reason, result=None, variants=True, **options):
+    """A C++ cast for which an approved exception, for `reason`, lets Rust
+    refuse as `Invalid` where Arrow C++ converts or, given `result`, return
+    exactly `result` instead of the C++ result. Any other difference is still
+    a disagreement."""
+    case = Case(input, to, options, None, label, variants)
     case.exception = reason
+    case.exception_result = result
     return case
 
 
@@ -1868,7 +1890,7 @@ def nested_types():
     yield exact(pa.array([[], []], pa.list_(pa.int32())), pa.list_(pa.int64(), 0), "empty lists to a zero width fixed size list")
     for make in [pa.list_, pa.large_list]:
         nulls = pa.array([[None]], make(pa.int32()))
-        yield exact(nulls, make(pa.field("item", pa.int64(), nullable=False)), f"null item of {nulls.type} to a non-nullable item")
+        yield excepted(nulls, make(pa.field("item", pa.int64(), nullable=False)), f"null item of {nulls.type} to a non-nullable item", NON_NULLABLE_NULLS, variants=False)
     struct = pa.array([{"x": None}], pa.struct([("x", pa.int32())]))
     yield exact(struct, pa.struct([pa.field("x", pa.int64(), nullable=False)]), "null field to a non-nullable field")
     values = pa.array([10, 20, 30, 40], pa.int32())
@@ -2013,3 +2035,119 @@ def unmapped_tests():
         for name in CPP_TESTS + SCALAR_CPP_TESTS
         if name not in translated and name not in MAPPED_ELSEWHERE
     ]
+
+
+def decimal_parsing():
+    """Beyond the C++ tests: decimal strings whose scale is far beyond the
+    target's, which Arrow C++ divides to zero, and exponents whose scale
+    wraps in 32 bits, which Arrow C++ refuses."""
+    for make, precision in [(pa.decimal32, 5), (pa.decimal64, 10), (pa.decimal128, 10), (pa.decimal256, 10)]:
+        to = make(precision, 2)
+        for text in ["0." + "0" * 130, "0e-66", "1e-40", "1e-300", "-1e-300", "1e-2147483648", "1.5e-2147483647"]:
+            for options in [{}, dict(allow_decimal_truncate=True)]:
+                yield attempt(pa.array([text, None]), to, f"{text[:12]!r} to {to}", **options)
+
+
+_REGISTRY.append(("DecimalParsing", decimal_parsing))
+
+
+def decimal_to_wide_integer():
+    """Beyond the C++ tests: Decimal32 and Decimal64 to integers whose bounds
+    Arrow C++ narrows to the decimal's width."""
+    for source in [pa.decimal32(9, 0), pa.decimal64(18, 0)]:
+        for target in [pa.int32(), pa.uint32(), pa.int64(), pa.uint64()]:
+            for values in [[decimal.Decimal(0), decimal.Decimal(1), None], [decimal.Decimal(-1)], [None, None]]:
+                for options in [{}, dict(allow_int_overflow=True)]:
+                    yield attempt(pa.array(values, source), target, f"{values} as {source} to {target}", **options)
+
+
+_REGISTRY.append(("DecimalToWideInteger", decimal_to_wide_integer))
+
+
+def zoned_formatting():
+    """Beyond the C++ tests: zoned timestamps whose local time, rather than
+    their instant, is beyond the formattable years."""
+    for value, zone in [(-1096193779201, "+05:30"), (971890963199, "+05:30"), (971890963200, "UTC"), (971890963199, "UTC"), (-1096193779200, "-01:00")]:
+        for target in [pa.utf8(), pa.large_utf8(), pa.string_view()]:
+            yield exact(pa.array([value, None], pa.timestamp("s", zone)), target, f"{value} in {zone} to {target}")
+
+
+_REGISTRY.append(("ZonedFormatting", zoned_formatting))
+
+
+def extension_storage():
+    """Beyond the C++ tests: extensions cast to a storage type that has no
+    Arrow C++ cast function. Run-end encoded and union storages are not
+    compared: Rust does not import the arrays PyArrow exports."""
+    storages = [
+        pa.array([[1, 2]], pa.list_view(pa.int32())),
+        pa.array([[1, 2]], pa.large_list_view(pa.int32())),
+    ]
+    for storage in storages:
+        extension = pa.ExtensionArray.from_storage(pa.opaque(storage.type, "t", "v"), storage)
+        yield exact(extension, storage.type, f"extension over {storage.type} to its storage")
+        yield exact(extension.slice(0, 0), storage.type, f"empty extension over {storage.type} to its storage")
+    dictionary = pa.DictionaryArray.from_arrays(pa.array([0], pa.int8()), pa.array(["a"]))
+    extension = pa.ExtensionArray.from_storage(pa.opaque(dictionary.type, "t", "v"), dictionary)
+    yield exact(extension, pa.null(), "extension over a dictionary to null")
+    yield exact(extension.slice(0, 0), pa.null(), "empty extension over a dictionary to null")
+    ints = pa.ExtensionArray.from_storage(pa.opaque(pa.int32(), "t", "v"), pa.array([1], pa.int32()))
+    yield exact(ints, pa.int64(), "extension over int32 to int64")
+
+
+_REGISTRY.append(("ExtensionStorage", extension_storage))
+
+
+def error_categories():
+    """Beyond the C++ tests: the order of checks that decides the category
+    of a refusal, and fixed size binary beyond 32-bit offsets. The large
+    inputs map a sparse file, so no value is written or read."""
+    import tempfile
+
+    for values in [pa.array(["2020-01-01"], pa.string_view()), pa.array([b"2020-01-01"], pa.binary_view())]:
+        dictionary = pa.DictionaryArray.from_arrays(pa.array([0], pa.int8()), values)
+        for target in [pa.date32(), pa.timestamp("s"), pa.month_day_nano_interval(), pa.int32()]:
+            yield exact(dictionary, target, f"dictionary of {values.type} to {target}")
+    nulls = pa.StructArray.from_arrays([pa.nulls(2)], fields=[pa.field("a", pa.null())])
+    yield exact(nulls, pa.struct([pa.field("a", pa.int32(), nullable=False)]), "null field to a non-nullable field")
+    masked = pa.StructArray.from_arrays([pa.nulls(2)], fields=[pa.field("a", pa.null())], mask=pa.array([True, True]))
+    yield exact(masked, pa.struct([pa.field("a", pa.int32(), nullable=False)]), "null field under null rows to a non-nullable field")
+    width, length = 1 << 20, 2049
+    with tempfile.NamedTemporaryFile() as file:
+        file.truncate(width * length)
+        with pa.memory_map(file.name, "r") as mapped:
+            data = mapped.read_buffer(width * length)
+            fixed = pa.Array.from_buffers(pa.binary(width), length, [None, data])
+            for target in [pa.binary(), pa.utf8(), pa.binary_view(), pa.string_view()]:
+                yield exact(fixed, target, f"{length} values of {fixed.type} to {target}")
+            # Arrow C++ casts the last value alone to 32-bit offsets that
+            # start at 2^31 and wrap, an invalid array, so only views compare.
+            for target in [pa.binary_view(), pa.string_view()]:
+                yield exact(fixed.slice(length - 1, 1), target, f"last value of {fixed.type} to {target}")
+
+
+_REGISTRY.append(("ErrorCategories", error_categories))
+
+
+def approved_exceptions():
+    """Beyond the C++ tests: the approved exceptions of revision 14."""
+    maps = pa.array([[(1, None), (2, 3)]], pa.map_(pa.int32(), pa.int32()))
+    yield excepted(maps, pa.map_(pa.int32(), pa.field("value", pa.int32(), nullable=False)), "null map value to a non-nullable value", NON_NULLABLE_NULLS, variants=False)
+    yield attempt(pa.array([[(1, 2)]], pa.map_(pa.int32(), pa.int32())), pa.map_(pa.int32(), pa.field("value", pa.int32(), nullable=False)), "map value to a non-nullable value")
+    dictionary = pa.DictionaryArray.from_arrays(pa.array([0, 1], pa.int8()), pa.array([1, None]))
+    encoded = pa.StructArray.from_arrays([dictionary], ["a"])
+    yield excepted(encoded, pa.struct([pa.field("a", pa.int32(), nullable=False)]), "null dictionary value to a non-nullable field", NON_NULLABLE_NULLS, variants=False)
+    for value, scale, source in [(0.0001, 0, pa.float64()), (0.0004, 2, pa.float64()), (1e-30, 3, pa.float64()), (1e-30, 17, pa.float64()), (5e-324, 0, pa.float64()), (-0.0001, 0, pa.float64()), (1e-20, 2, pa.float32())]:
+        to = pa.decimal64(18, scale)
+        yield excepted(pa.array([value, None], source), to, f"{value} as {source} to {to}", UNDEFINED_DECIMAL64_SHIFT, result=pa.array([decimal.Decimal(0), None], to), variants=False)
+    for value, unit in [(-371085174374400, "s"), (185542587187205, "s"), (185542587187205000, "ms")]:
+        for target in [pa.date32(), pa.date64(), pa.time32("s"), pa.time64("us")]:
+            yield excepted(pa.array([value, None], pa.timestamp(unit)), target, f"{value} {unit} to {target}", UNREPRESENTABLE_LOCAL_TIME, variants=False)
+    for value, unit in [(10000000008000, "s"), (9 * 10**18, "us"), (-9 * 10**18, "us")]:
+        for target in [pa.date32(), pa.time64("us")]:
+            yield excepted(pa.array([value, None], pa.timestamp(unit, "+05:00")), target, f"{value} {unit} in +05:00 to {target}", UNREPRESENTABLE_LOCAL_TIME, variants=False)
+    for target in [pa.date32(), pa.time32("s"), pa.utf8()]:
+        yield excepted(pa.array([0, None], pa.timestamp("s", "localtime")), target, f"timestamp in localtime to {target}", BUNDLED_ZONES, variants=False)
+
+
+_REGISTRY.append(("ApprovedExceptions", approved_exceptions))
