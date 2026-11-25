@@ -685,13 +685,17 @@ fn formatted(array: &dyn Array, to_type: &DataType) -> Result<Option<ArrayRef>, 
     if !matches!(to_type, Utf8 | LargeUtf8 | Utf8View) {
         return Ok(None);
     }
-    type Format<'a> = Box<dyn Fn(usize, &mut String) + 'a>;
+    /// Appends the text of the value at an index, or refuses it.
+    type Format<'a> = Box<dyn Fn(usize, &mut String) -> Result<(), ArrowError> + 'a>;
     fn integer<T: ArrowPrimitiveType>(array: &dyn Array) -> Format<'_>
     where
         T::Native: std::fmt::Display,
     {
         let array = array.as_primitive::<T>();
-        Box::new(move |i, out| write!(out, "{}", array.value(i)).expect("writes to a String"))
+        Box::new(move |i, out| {
+            write!(out, "{}", array.value(i)).expect("writes to a String");
+            Ok(())
+        })
     }
     fn decimal<T: DecimalType>(array: &dyn Array, scale: i8) -> Format<'_>
     where
@@ -707,18 +711,23 @@ fn formatted(array: &dyn Array, to_type: &DataType) -> Result<Option<ArrayRef>, 
                     "<scale out of range, cannot format {} value>",
                     T::PREFIX
                 )
-                .expect("writes to a String")
+                .expect("writes to a String");
+                Ok(())
             });
         }
         Box::new(move |i, out| {
             write!(out, "{}", array.value(i)).expect("writes to a String");
             adjust_integer_string_with_scale(scale as i32, out);
+            Ok(())
         })
     }
     let format: Format = match array.data_type() {
         Boolean => {
             let array = array.as_boolean();
-            Box::new(move |i, out| out.push_str(if array.value(i) { "true" } else { "false" }))
+            Box::new(move |i, out| {
+                out.push_str(if array.value(i) { "true" } else { "false" });
+                Ok(())
+            })
         }
         Int8 => integer::<Int8Type>(array),
         Int16 => integer::<Int16Type>(array),
@@ -730,22 +739,32 @@ fn formatted(array: &dyn Array, to_type: &DataType) -> Result<Option<ArrayRef>, 
         UInt64 => integer::<UInt64Type>(array),
         Duration(_) => {
             let value = wide_values(array)?;
-            Box::new(move |i, out| write!(out, "{}", value(i)).expect("writes to a String"))
+            Box::new(move |i, out| {
+                write!(out, "{}", value(i)).expect("writes to a String");
+                Ok(())
+            })
         }
         Float16 => {
             let array = array.as_primitive::<Float16Type>();
             Box::new(move |i, out| {
                 let shortest = format!("{:e}", array.value(i).to_f32() as f64);
-                format_cpp_float(&shortest, out)
+                format_cpp_float(&shortest, out);
+                Ok(())
             })
         }
         Float32 => {
             let array = array.as_primitive::<Float32Type>();
-            Box::new(move |i, out| format_cpp_float(&format!("{:e}", array.value(i)), out))
+            Box::new(move |i, out| {
+                format_cpp_float(&format!("{:e}", array.value(i)), out);
+                Ok(())
+            })
         }
         Float64 => {
             let array = array.as_primitive::<Float64Type>();
-            Box::new(move |i, out| format_cpp_float(&format!("{:e}", array.value(i)), out))
+            Box::new(move |i, out| {
+                format_cpp_float(&format!("{:e}", array.value(i)), out);
+                Ok(())
+            })
         }
         Decimal32(_, scale) => decimal::<Decimal32Type>(array, *scale),
         Decimal64(_, scale) => decimal::<Decimal64Type>(array, *scale),
@@ -760,6 +779,7 @@ fn formatted(array: &dyn Array, to_type: &DataType) -> Result<Option<ArrayRef>, 
                 } else {
                     write!(out, "<value out of range: {days}>").expect("writes to a String")
                 }
+                Ok(())
             })
         }
         Date64 => {
@@ -772,6 +792,7 @@ fn formatted(array: &dyn Array, to_type: &DataType) -> Result<Option<ArrayRef>, 
                 } else {
                     write!(out, "<value out of range: {millis}>").expect("writes to a String")
                 }
+                Ok(())
             })
         }
         Time32(unit) | Time64(unit) => {
@@ -784,6 +805,7 @@ fn formatted(array: &dyn Array, to_type: &DataType) -> Result<Option<ArrayRef>, 
                 } else {
                     write!(out, "<value out of range: {value}>").expect("writes to a String")
                 }
+                Ok(())
             })
         }
         Timestamp(unit, tz) => {
@@ -795,49 +817,72 @@ fn formatted(array: &dyn Array, to_type: &DataType) -> Result<Option<ArrayRef>, 
             let nanoseconds = matches!(unit, TimeUnit::Nanosecond);
             Box::new(move |i, out| {
                 let value = value(i);
-                if !nanoseconds && !in_date_range(value, per_day) {
-                    write!(out, "<value out of range: {value}>").expect("writes to a String");
-                    return;
-                }
-                let offset = zone
-                    .as_ref()
-                    .map_or(0, |zone| utc_offset(zone, value, per_second));
+                let Some(zone) = zone.as_ref() else {
+                    // Arrow C++ `StringFormatter` checks the instant.
+                    if nanoseconds || in_date_range(value, per_day) {
+                        format_date(value.div_euclid(per_day), out);
+                        out.push(' ');
+                        format_time(value.rem_euclid(per_day), per_second, out);
+                    } else {
+                        write!(out, "<value out of range: {value}>").expect("writes to a String");
+                    }
+                    return Ok(());
+                };
+                // Its zoned formatter fails on a local year it cannot print.
+                let offset = utc_offset(zone, value, per_second);
                 let local = value.wrapping_add(offset as i64 * per_second);
+                if !nanoseconds && !in_date_range(local, per_day) {
+                    return Err(ArrowError::CastError(format!(
+                        "Failed formatting timestamp {value}: the local year is out of range"
+                    )));
+                }
                 format_date(local.div_euclid(per_day), out);
                 out.push(' ');
                 format_time(local.rem_euclid(per_day), per_second, out);
                 if utc {
                     out.push('Z');
-                } else if zone.is_some() {
+                } else {
                     let sign = if offset < 0 { '-' } else { '+' };
                     let minutes = offset.abs() / 60;
                     write!(out, "{sign}{:02}{:02}", minutes / 60, minutes % 60)
                         .expect("writes to a String");
                 }
+                Ok(())
             })
         }
         _ => return Ok(None),
     };
+    // One reused buffer formats every value; each builder copies it once.
+    let len = array.len();
     let mut buffer = String::new();
-    let mut value = |i: usize| -> Option<String> {
-        array.is_valid(i).then(|| {
+    let mut fill = |append: &mut dyn FnMut(Option<&str>)| -> Result<(), ArrowError> {
+        for i in 0..len {
+            if array.is_null(i) {
+                append(None);
+                continue;
+            }
             buffer.clear();
-            format(i, &mut buffer);
-            buffer.clone()
-        })
+            format(i, &mut buffer)?;
+            append(Some(&buffer));
+        }
+        Ok(())
     };
     Ok(Some(match to_type {
-        Utf8 => Arc::new((0..array.len()).map(&mut value).collect::<StringArray>()),
-        LargeUtf8 => Arc::new(
-            (0..array.len())
-                .map(&mut value)
-                .collect::<LargeStringArray>(),
-        ),
-        Utf8View => Arc::new(
-            (0..array.len())
-                .map(&mut value)
-                .collect::<StringViewArray>(),
-        ),
+        Utf8 => {
+            let mut builder = StringBuilder::with_capacity(len, len * 8);
+            fill(&mut |v| builder.append_option(v))?;
+            Arc::new(builder.finish())
+        }
+        LargeUtf8 => {
+            let mut builder = LargeStringBuilder::with_capacity(len, len * 8);
+            fill(&mut |v| builder.append_option(v))?;
+            Arc::new(builder.finish())
+        }
+        Utf8View => {
+            let mut builder = StringViewBuilder::with_capacity(len);
+            fill(&mut |v| builder.append_option(v))?;
+            Arc::new(builder.finish())
+        }
         _ => return Ok(None),
     }))
 }
