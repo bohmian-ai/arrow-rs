@@ -641,10 +641,26 @@ pub(crate) fn parse_cpp_integer<N: NumCast>(s: &[u8]) -> Option<N> {
 }
 
 /// Arrow C++ float parsing with `fast_float`: the general format with an
-/// optional leading `+`, `inf`, `infinity` and `nan` in any case, an
-/// out-of-range value saturating, and no surrounding characters.
+/// optional leading `+`, `inf`, `infinity` and `nan` in any case, `nan`
+/// followed by a parenthesized sequence of ASCII letters, digits and
+/// underscores, which reads as `nan`, an out-of-range value saturating, and
+/// no surrounding characters.
 fn parse_cpp_float<F: std::str::FromStr>(s: &[u8]) -> Option<F> {
-    std::str::from_utf8(s).ok()?.parse().ok()
+    let s = std::str::from_utf8(s).ok()?;
+    let unsigned = s.strip_prefix(['+', '-']).unwrap_or(s);
+    let payload = unsigned
+        .get(..4)
+        .filter(|nan| nan.eq_ignore_ascii_case("nan("))
+        .and_then(|_| unsigned[4..].strip_suffix(')'));
+    if payload.is_some_and(|payload| {
+        payload
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    }) {
+        // The sign and `nan`, without the sequence.
+        return s[..s.len() - unsigned.len() + 3].parse().ok();
+    }
+    s.parse().ok()
 }
 
 /// Formats the values of `array` as the strings of `to_type` as Arrow C++

@@ -512,3 +512,257 @@ pub(crate) fn cast_list_to_list_view<I: OffsetSizeTrait, O: OffsetSizeTrait>(
     );
     Ok(Arc::new(array))
 }
+
+/// A list, large list, list view, large list view or map array as Arrow C++
+/// reads it when it casts one as a list.
+///
+/// C++ reads a list view's offsets as list offsets and ignores its sizes,
+/// reading one offset past its length. The Rust array holds no such offset,
+/// so the end of the last view stands for it.
+struct CppList {
+    /// The `len + 1` offsets C++ reads.
+    offsets: Vec<i64>,
+    /// Whether the array is a slice of a longer one: C++ selects the values
+    /// of a list with a nonzero array offset and converts every value of one
+    /// with a zero offset. A Rust array keeps no array offset, so a slice is
+    /// recognized by an offsets buffer that starts inside its allocation.
+    sliced: bool,
+    /// The child array, unsliced.
+    values: ArrayRef,
+}
+
+impl CppList {
+    /// Reads `array`, which is of a list-like type.
+    fn new(array: &dyn Array) -> Self {
+        fn list<O: OffsetSizeTrait>(array: &GenericListArray<O>) -> CppList {
+            CppList {
+                offsets: array
+                    .offsets()
+                    .iter()
+                    .map(|o| o.as_usize() as i64)
+                    .collect(),
+                sliced: array.offsets().inner().inner().ptr_offset() != 0,
+                values: array.values().clone(),
+            }
+        }
+        fn view<O: OffsetSizeTrait>(array: &GenericListViewArray<O>) -> CppList {
+            let mut offsets: Vec<i64> = array
+                .offsets()
+                .iter()
+                .map(|o| o.as_usize() as i64)
+                .collect();
+            let end = array.len().checked_sub(1).map_or(0, |last| {
+                (array.offsets()[last].as_usize() + array.sizes()[last].as_usize()) as i64
+            });
+            offsets.push(end);
+            CppList {
+                offsets,
+                sliced: array.offsets().inner().ptr_offset() != 0,
+                values: array.values().clone(),
+            }
+        }
+        match array.data_type() {
+            DataType::List(_) => list(array.as_list::<i32>()),
+            DataType::LargeList(_) => list(array.as_list::<i64>()),
+            DataType::ListView(_) => view(array.as_list_view::<i32>()),
+            DataType::LargeListView(_) => view(array.as_list_view::<i64>()),
+            DataType::Map(..) => {
+                let map = array.as_map();
+                CppList {
+                    offsets: map.offsets().iter().map(|o| *o as i64).collect(),
+                    sliced: map.offsets().inner().inner().ptr_offset() != 0,
+                    values: Arc::new(map.entries().clone()),
+                }
+            }
+            _ => unreachable!("only list-like arrays are cast as lists"),
+        }
+    }
+
+    /// The offsets and values of the list C++ `CastList::HandleOffsets`
+    /// makes: a slice keeps the values from its first offset, as many as its
+    /// last offset counts, and rebases its offsets on the first.
+    ///
+    /// # Errors
+    ///
+    /// [`ArrowError::CastError`] (C++ `Invalid`) when the last offset exceeds
+    /// `max`, the largest offset of the target, and when the offsets C++
+    /// reads do not delimit lists of the values, as the offsets of list views
+    /// that are not in list order may not.
+    fn select(
+        self,
+        from: &DataType,
+        to: &DataType,
+        max: i64,
+    ) -> Result<(Vec<i64>, ArrayRef), ArrowError> {
+        let Self {
+            mut offsets,
+            sliced,
+            mut values,
+        } = self;
+        let end = offsets[offsets.len() - 1];
+        if end > max {
+            return Err(ArrowError::CastError(format!(
+                "Array of type {from} too large to convert to {to}"
+            )));
+        }
+        let first = offsets[0];
+        let ordered = |offsets: &[i64], len: usize| {
+            offsets.windows(2).all(|w| w[0] <= w[1]) && offsets[offsets.len() - 1] as usize <= len
+        };
+        if sliced && first as usize <= values.len() {
+            let first_index = first as usize;
+            values = values.slice(first_index, (values.len() - first_index).min(end as usize));
+            offsets.iter_mut().for_each(|offset| *offset -= first);
+        }
+        if !ordered(&offsets, values.len()) {
+            return Err(ArrowError::CastError(format!(
+                "The offsets Arrow C++ reads from the {from} array do not delimit lists of its values"
+            )));
+        }
+        Ok((offsets, values))
+    }
+}
+
+/// Casts a list, large list, list view or large list view array to a list or
+/// large list, or a map array to a list, large list or map, as Arrow C++
+/// `CastList` and `CastMap` do: the offsets select values as
+/// [`CppList::select`] describes, then the values convert. A map converts its
+/// keys and values by position into the two fields of the target's struct,
+/// whose entries have no nulls, and takes the target's sort flag.
+///
+/// # Errors
+///
+/// The errors of [`CppList::select`], [`ArrowError::SchemaError`] (C++
+/// `TypeError`) for a map cast to a list of other than a struct of two
+/// fields, and any error of converting the values.
+pub(crate) fn conversion_list(
+    array: &dyn Array,
+    to_type: &DataType,
+    cast_options: &CastContext,
+) -> Result<ArrayRef, ArrowError> {
+    let from_type = array.data_type();
+    let max = match to_type {
+        DataType::LargeList(_) => i64::MAX,
+        _ => i32::MAX as i64,
+    };
+    let (offsets, values) = CppList::new(array).select(from_type, to_type, max)?;
+    let (DataType::List(target) | DataType::LargeList(target) | DataType::Map(target, _)) = to_type
+    else {
+        unreachable!("the dispatcher casts lists to lists and maps")
+    };
+    let values = match from_type {
+        DataType::Map(..) => {
+            let DataType::Struct(fields) = target.data_type() else {
+                return Err(map_entries(to_type));
+            };
+            let [key, value] = fields.iter().collect::<Vec<_>>()[..] else {
+                return Err(map_entries(to_type));
+            };
+            let entries = values.as_struct();
+            let from = entries.fields();
+            let keys = cast_field_with_context(entries.column(0), &from[0], key, cast_options)?;
+            let values = cast_field_with_context(entries.column(1), &from[1], value, cast_options)?;
+            Arc::new(StructArray::try_new(
+                fields.clone(),
+                vec![keys, values],
+                None,
+            )?)
+        }
+        _ => cast_field_with_context(&values, item(from_type), target, cast_options)?,
+    };
+    let nulls = array.nulls().cloned();
+    Ok(match to_type {
+        DataType::LargeList(_) => Arc::new(LargeListArray::try_new(
+            target.clone(),
+            OffsetBuffer::new(offsets.into()),
+            values,
+            nulls,
+        )?),
+        DataType::List(_) => Arc::new(ListArray::try_new(
+            target.clone(),
+            OffsetBuffer::new(offsets.iter().map(|o| *o as i32).collect()),
+            values,
+            nulls,
+        )?),
+        DataType::Map(_, sorted) => Arc::new(MapArray::try_new(
+            target.clone(),
+            OffsetBuffer::new(offsets.iter().map(|o| *o as i32).collect()),
+            values.as_struct().clone(),
+            nulls,
+            *sorted,
+        )?),
+        _ => unreachable!("matched above"),
+    })
+}
+
+/// The Arrow C++ type error of a map cast to a list of other than a struct
+/// of two fields.
+pub(crate) fn map_entries(to_type: &DataType) -> ArrowError {
+    ArrowError::SchemaError(format!(
+        "Map type must be cast to a list<struct> with exactly two fields, not {to_type}"
+    ))
+}
+
+/// Casts a list, large list, list view or large list view array to a fixed
+/// size list as Arrow C++ `CastVarToFixedList` does: every list that is not
+/// null must hold `size` values, every value of the child converts before
+/// any is selected, and the lists then select their values.
+///
+/// # Errors
+///
+/// [`ArrowError::CastError`] (C++ `Invalid`) for a list of another size, and
+/// any error of converting the values.
+pub(crate) fn conversion_list_to_fixed_size_list(
+    array: &dyn Array,
+    field: &FieldRef,
+    size: i32,
+    cast_options: &CastContext,
+) -> Result<ArrayRef, ArrowError> {
+    let CppList {
+        offsets, values, ..
+    } = CppList::new(array);
+    let width = size as i64;
+    let mut expected = offsets[0] + width;
+    let mut nulls_have_correct_length = true;
+    for (i, &end) in offsets.iter().enumerate().skip(1) {
+        if array.is_null(i - 1) {
+            nulls_have_correct_length &= end == expected;
+            expected = end + width;
+        } else if end != expected {
+            return Err(ArrowError::CastError(
+                "ListType can only be casted to FixedSizeListType if the lists are all the \
+                 expected size."
+                    .to_string(),
+            ));
+        } else {
+            expected += width;
+        }
+    }
+    let values = cast_field_with_context(&values, item(array.data_type()), field, cast_options)?;
+    let len = array.len() * size as usize;
+    let values = if array.null_count() > 0 && !nulls_have_correct_length {
+        let indices: UInt64Array = (0..array.len())
+            .flat_map(|i| {
+                let start = (!array.is_null(i)).then(|| offsets[i] as u64);
+                (0..size as u64).map(move |j| start.map(|start| start + j))
+            })
+            .collect();
+        take(&values, &indices, None)?
+    } else {
+        let start = offsets[0] as usize;
+        if start + len > values.len() {
+            return Err(ArrowError::CastError(format!(
+                "The offsets of the {} array do not delimit lists of its values",
+                array.data_type()
+            )));
+        }
+        values.slice(start, len)
+    };
+    Ok(Arc::new(FixedSizeListArray::try_new_with_length(
+        field.clone(),
+        size,
+        values,
+        array.nulls().cloned(),
+        array.len(),
+    )?))
+}

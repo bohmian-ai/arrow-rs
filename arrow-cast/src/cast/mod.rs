@@ -1164,6 +1164,116 @@ pub(crate) fn cpp_registered(from: &DataType, to: &DataType) -> bool {
     }
 }
 
+/// Refuses a large binary or large string array whose last offset, counted
+/// from the start of its data, exceeds what a binary, string or view target
+/// addresses, as Arrow C++ does before it converts any value, null or not.
+///
+/// # Errors
+///
+/// [`ArrowError::CastError`] (C++ `Invalid`) for a binary or string target
+/// and [`ArrowError::OffsetOverflowError`] (C++ `CapacityError`) for a view
+/// target.
+fn conversion_byte_capacity(array: &dyn Array, to_type: &DataType) -> Result<(), ArrowError> {
+    use DataType::*;
+    let end = match array.data_type() {
+        LargeBinary => array.as_binary::<i64>().offsets().last().as_usize(),
+        LargeUtf8 => array.as_string::<i64>().offsets().last().as_usize(),
+        _ => return Ok(()),
+    };
+    if i32::try_from(end).is_ok() {
+        return Ok(());
+    }
+    match to_type {
+        Binary | Utf8 => Err(ArrowError::CastError(format!(
+            "Failed casting from {} to {to_type}: input array too large",
+            array.data_type()
+        ))),
+        BinaryView | Utf8View => Err(ArrowError::OffsetOverflowError(end)),
+        _ => Ok(()),
+    }
+}
+
+/// Whether Arrow C++ `DataType::Equals` holds between `from` and `to`. It
+/// ignores the names and metadata of the items of lists, list views and
+/// maps, but not their nullability, and compares the names of struct and
+/// union fields. A field's extension type is part of its C++ type.
+fn cpp_equal(from: &DataType, to: &DataType) -> bool {
+    use DataType::*;
+    fn extension(field: &Field) -> (Option<&str>, Option<&str>) {
+        (field.extension_type_name(), field.extension_type_metadata())
+    }
+    fn typed(a: &Field, b: &Field) -> bool {
+        extension(a) == extension(b) && cpp_equal(a.data_type(), b.data_type())
+    }
+    fn item(a: &Field, b: &Field) -> bool {
+        a.is_nullable() == b.is_nullable() && typed(a, b)
+    }
+    fn field(a: &Field, b: &Field) -> bool {
+        a.name() == b.name() && item(a, b)
+    }
+    match (from, to) {
+        (List(a), List(b))
+        | (LargeList(a), LargeList(b))
+        | (ListView(a), ListView(b))
+        | (LargeListView(a), LargeListView(b)) => item(a, b),
+        (FixedSizeList(a, n), FixedSizeList(b, m)) => n == m && item(a, b),
+        (Map(a, a_sorted), Map(b, b_sorted)) => match (a.data_type(), b.data_type()) {
+            (Struct(a), Struct(b)) if a.len() == 2 && b.len() == 2 => {
+                a_sorted == b_sorted && typed(&a[0], &b[0]) && typed(&a[1], &b[1])
+            }
+            _ => from == to,
+        },
+        (Struct(a), Struct(b)) => {
+            a.len() == b.len() && a.iter().zip(b.iter()).all(|(a, b)| field(a, b))
+        }
+        (Union(a, a_mode), Union(b, b_mode)) => {
+            a_mode == b_mode
+                && a.len() == b.len()
+                && a.iter()
+                    .zip(b.iter())
+                    .all(|((a_id, a), (b_id, b))| a_id == b_id && field(a, b))
+        }
+        (Dictionary(a_key, a), Dictionary(b_key, b)) => a_key == b_key && cpp_equal(a, b),
+        (RunEndEncoded(a_ends, a), RunEndEncoded(b_ends, b)) => {
+            a_ends.data_type() == b_ends.data_type() && typed(a, b)
+        }
+        _ => from == to,
+    }
+}
+
+/// `data` as an array of `to`, a type [`cpp_equal`] to its own: the same
+/// buffers, with the fields of `to` at every level.
+///
+/// # Errors
+///
+/// Any error of validating the relabeled data.
+fn relabel(data: ArrayData, to: &DataType) -> Result<ArrayData, ArrowError> {
+    use DataType::*;
+    let children: Vec<&DataType> = match to {
+        List(item)
+        | LargeList(item)
+        | ListView(item)
+        | LargeListView(item)
+        | FixedSizeList(item, _)
+        | Map(item, _) => vec![item.data_type()],
+        Struct(fields) => fields.iter().map(|field| field.data_type()).collect(),
+        Union(fields, _) => fields.iter().map(|(_, field)| field.data_type()).collect(),
+        RunEndEncoded(ends, values) => vec![ends.data_type(), values.data_type()],
+        Dictionary(_, values) => vec![values],
+        _ => vec![],
+    };
+    let child_data = data
+        .child_data()
+        .iter()
+        .zip(children)
+        .map(|(child, to)| relabel(child.clone(), to))
+        .collect::<Result<Vec<_>, _>>()?;
+    data.into_builder()
+        .data_type(to.clone())
+        .child_data(child_data)
+        .build()
+}
+
 /// The cast dispatcher behind [`cast_with_options`] and
 /// [`cast_with_conversion_options`].
 pub(crate) fn cast_with_context(
@@ -1178,6 +1288,11 @@ pub(crate) fn cast_with_context(
         return Ok(make_array(array.to_data()));
     }
     if cast_options.conversion.is_some() {
+        // Arrow C++ returns an input whose type equals the target as a view
+        // of the target type, without a kernel.
+        if cpp_equal(from_type, to_type) {
+            return Ok(make_array(relabel(array.to_data(), to_type)?));
+        }
         if !cpp_registered(from_type, to_type) {
             return Err(ArrowError::NotYetImplemented(format!(
                 "Unsupported cast from {from_type} to {to_type}"
@@ -1188,6 +1303,7 @@ pub(crate) fn cast_with_context(
         if array.is_empty() {
             return Ok(new_empty_array(to_type));
         }
+        conversion_byte_capacity(array, to_type)?;
     }
     if let Some(conversion) = &cast_options.conversion
         && let Some(result) = conversion_temporal(array, to_type, conversion)
@@ -1206,10 +1322,22 @@ pub(crate) fn cast_with_context(
             Utf8 | LargeUtf8 | Utf8View | Binary | LargeBinary | BinaryView,
             FixedSizeBinary(width),
         ) if cast_options.conversion.is_some() => conversion_to_fixed_size_binary(array, *width),
-        (Map(..), List(_) | LargeList(_) | FixedSizeList(..))
+        (
+            List(_) | LargeList(_) | ListView(_) | LargeListView(_) | Map(..),
+            List(_) | LargeList(_),
+        )
+        | (Map(..), Map(..))
             if cast_options.conversion.is_some() =>
         {
-            conversion_map_to_list(array.as_map(), to_type, cast_options)
+            conversion_list(array, to_type, cast_options)
+        }
+        (List(_) | LargeList(_) | ListView(_) | LargeListView(_), FixedSizeList(field, size))
+            if cast_options.conversion.is_some() =>
+        {
+            conversion_list_to_fixed_size_list(array, field, *size, cast_options)
+        }
+        (Map(..), FixedSizeList(field, size)) if cast_options.conversion.is_some() => {
+            conversion_map_to_fixed_size_list(array.as_map(), field, *size, cast_options)
         }
         (Utf8 | LargeUtf8, Timestamp(..)) if cast_options.conversion.is_some() => {
             conversion_parse_timestamp(array, to_type)
@@ -1326,6 +1454,17 @@ pub(crate) fn cast_with_context(
                 unreachable!("a fixed size list array has a fixed size list type")
             };
             let values = cast_field_with_context(array.values(), list_from, list_to, cast_options)?;
+            if cast_options.conversion.is_some() {
+                // A list of size zero keeps its length, which its values
+                // cannot give.
+                return Ok(Arc::new(FixedSizeListArray::try_new_with_length(
+                    list_to.clone(),
+                    *size_from,
+                    values,
+                    array.nulls().cloned(),
+                    array.len(),
+                )?));
+            }
             Ok(Arc::new(FixedSizeListArray::try_new(
                 list_to.clone(),
                 *size_from,
@@ -13649,14 +13788,16 @@ mod tests {
                 Some(vec![None]),
             ])
         );
-        // As the permissive cast checks a slice's hidden values for overflow,
-        // the strict cast checks them for fractions.
+        // Arrow C++ converts only the values a slice of a list references.
         let hiding = ListArray::from_iter_primitive::<Float64Type, _, _>(vec![
             Some(vec![Some(2.5)]),
             Some(vec![Some(3.0)]),
         ])
         .slice(1, 1);
-        assert!(strict(&hiding, &to_list).is_err());
+        assert_eq!(
+            strict(&hiding, &to_list).unwrap().as_list::<i32>(),
+            &ListArray::from_iter_primitive::<Int64Type, _, _>(vec![Some(vec![Some(3)])])
+        );
 
         let measured = |x: Vec<Option<f64>>| -> ArrayRef {
             let names = StringArray::from(vec![Some("a"); x.len()]);

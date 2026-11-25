@@ -1801,7 +1801,8 @@ _REGISTRY.append(("ExtensionContext", extension_context))
 
 def exact(input, to, label, **options):
     """A comparison of `input` alone, without the scalar, slice and chunk
-    variants, for an input whose physical layout is the point of the case."""
+    variants, for an input whose physical layout is the point of the case or
+    whose scalar C++ casts by another path than its array."""
     return Case(input, to, options, None, label, variants=False)
 
 
@@ -1881,7 +1882,10 @@ def nested_types():
         yield exact(adjacent.slice(1, 2), to(pa.int64()), f"sliced {make.__name__} of adjacent lists")
     for make, view in [(pa.ListViewArray, pa.list_view), (pa.LargeListViewArray, pa.large_list_view)]:
         renamed = make.from_arrays([0], [1], pa.array([7], pa.int32()), type=view(pa.field("source_name", pa.int32())))
-        yield attempt(renamed, view(pa.field("target_name", pa.int32())), f"{renamed.type} to another item name")
+        # An array of a type equal to the target is a view of it; a scalar
+        # takes no such path and finds no list view cast, so only arrays
+        # are compared.
+        yield exact(renamed, view(pa.field("target_name", pa.int32())), f"{renamed.type} to another item name")
     nested = pa.array([[[7]]], pa.list_(pa.list_view(pa.field("a", pa.int32()))))
     yield attempt(nested, pa.list_(pa.list_view(pa.field("b", pa.int32()))), "list of list views to another item name")
     renamed = pa.array([[1]], pa.list_(pa.field("a", pa.int32())))

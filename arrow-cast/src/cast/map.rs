@@ -55,59 +55,27 @@ pub(crate) fn cast_map_values(
     )?))
 }
 
-/// Casts `from` as Arrow C++ does, as the list of its entries. A list or
-/// large list target must hold a struct of exactly two fields, which take the
-/// key and the value by position, as C++ `CastMap` does; a fixed size list
-/// target casts the entries as a list of structs.
+/// Casts `from` to a fixed size list as Arrow C++ does, as the list of its
+/// entries cast to a list of structs.
 ///
 /// # Errors
 ///
-/// [`ArrowError::SchemaError`], the Arrow C++ type error, for a list item
-/// that is not a struct of two fields, and any error of casting the entries.
-pub(crate) fn conversion_map_to_list(
+/// The errors of [`conversion_list_to_fixed_size_list`].
+pub(crate) fn conversion_map_to_fixed_size_list(
     from: &MapArray,
-    to_type: &DataType,
+    field: &FieldRef,
+    size: i32,
     cast_options: &CastContext,
 ) -> Result<ArrayRef, ArrowError> {
     let entries = from.entries();
-    let entries = match to_type {
-        DataType::List(item) | DataType::LargeList(item) => {
-            let DataType::Struct(fields) = item.data_type() else {
-                return Err(two_fields(to_type));
-            };
-            let [key, value] = fields.iter().collect::<Vec<_>>()[..] else {
-                return Err(two_fields(to_type));
-            };
-            let entries = from.entries().fields();
-            let keys = cast_field_with_context(from.keys(), &entries[0], key, cast_options)?;
-            let values = cast_field_with_context(from.values(), &entries[1], value, cast_options)?;
-            let entries = StructArray::try_new(fields.clone(), vec![keys, values], None)?;
-            let list = ListArray::try_new(
-                item.clone(),
-                from.offsets().clone(),
-                Arc::new(entries),
-                from.nulls().cloned(),
-            )?;
-            return cast_with_context(&list, to_type, cast_options);
-        }
-        _ => entries.clone(),
-    };
     let item = Field::new("entries", entries.data_type().clone(), false);
     let list = ListArray::try_new(
         Arc::new(item),
         from.offsets().clone(),
-        Arc::new(entries),
+        Arc::new(entries.clone()),
         from.nulls().cloned(),
     )?;
-    cast_with_context(&list, to_type, cast_options)
-}
-
-/// The Arrow C++ type error of a map cast to a list of other than a struct
-/// of two fields.
-fn two_fields(to_type: &DataType) -> ArrowError {
-    ArrowError::SchemaError(format!(
-        "Map type must be cast to a list<struct> with exactly two fields, not {to_type}"
-    ))
+    conversion_list_to_fixed_size_list(&list, field, size, cast_options)
 }
 
 /// Gets the key field from the entries of a map.  For all other types returns None.
