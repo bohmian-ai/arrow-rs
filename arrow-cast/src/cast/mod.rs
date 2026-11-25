@@ -3036,7 +3036,13 @@ fn conversion_struct_to_struct(
             };
             let from_field = &from_fields[index];
             let values = array.column(index);
-            if from_field.is_nullable() && !to_field.is_nullable() && values.null_count() > 0 {
+            // Arrow C++ counts every value of a null array as null.
+            let nulls = if values.data_type() == &DataType::Null {
+                values.len()
+            } else {
+                values.null_count()
+            };
+            if from_field.is_nullable() && !to_field.is_nullable() && nulls > 0 {
                 return Err(ArrowError::CastError(format!(
                     "field '{}' of type {} has nulls. Can't cast to non-nullable field '{}' of type {}",
                     from_field.name(),

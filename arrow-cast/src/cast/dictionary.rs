@@ -327,9 +327,10 @@ pub(crate) fn unpack_dictionary<K: ArrowDictionaryKeyType>(
 ///
 /// # Errors
 ///
-/// Returns [`ArrowError::NotYetImplemented`] for binary view values, which
-/// Arrow C++ cannot select, and [`ArrowError::CastError`] when the value type
-/// has no cast to `to_type` or a referenced value fails to convert.
+/// Returns [`ArrowError::CastError`] when the value type has no cast to
+/// `to_type`, then [`ArrowError::NotYetImplemented`] for binary view values,
+/// which Arrow C++ cannot select, and [`ArrowError::CastError`] when a
+/// referenced value fails to convert.
 fn conversion_unpack_dictionary<K: ArrowDictionaryKeyType>(
     array: &DictionaryArray<K>,
     to_type: &DataType,
@@ -339,14 +340,14 @@ fn conversion_unpack_dictionary<K: ArrowDictionaryKeyType>(
     if to_type == &DataType::Null {
         return Ok(new_null_array(to_type, array.len()));
     }
-    if matches!(value_type, DataType::Utf8View | DataType::BinaryView) {
-        return Err(ArrowError::NotYetImplemented(format!(
-            "Selecting {value_type} dictionary values is not supported"
-        )));
-    }
     if value_type != to_type && !cpp_registered(value_type, to_type) {
         return Err(ArrowError::CastError(format!(
             "Cast type {to_type} incompatible with dictionary type {value_type}"
+        )));
+    }
+    if matches!(value_type, DataType::Utf8View | DataType::BinaryView) {
+        return Err(ArrowError::NotYetImplemented(format!(
+            "Selecting {value_type} dictionary values is not supported"
         )));
     }
     let values = take(array.values().as_ref(), array.keys(), None)?;
