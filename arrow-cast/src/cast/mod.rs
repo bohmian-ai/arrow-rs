@@ -1336,6 +1336,21 @@ pub(crate) fn cast_with_context(
         {
             conversion_list_to_fixed_size_list(array, field, *size, cast_options)
         }
+        (Utf8 | LargeUtf8 | Binary | LargeBinary, Dictionary(..))
+            if cast_options.conversion.is_some() =>
+        {
+            // Arrow C++ encodes the bytes as a dictionary of 32-bit indices,
+            // then casts its indices and its values.
+            let encoded = match from_type {
+                Utf8 => pack_byte_to_dictionary::<Int32Type, Utf8Type>(array, cast_options),
+                LargeUtf8 => {
+                    pack_byte_to_dictionary::<Int32Type, LargeUtf8Type>(array, cast_options)
+                }
+                Binary => pack_byte_to_dictionary::<Int32Type, BinaryType>(array, cast_options),
+                _ => pack_byte_to_dictionary::<Int32Type, LargeBinaryType>(array, cast_options),
+            }?;
+            dictionary_cast::<Int32Type>(&encoded, to_type, cast_options)
+        }
         (Map(..), FixedSizeList(field, size)) if cast_options.conversion.is_some() => {
             conversion_map_to_fixed_size_list(array.as_map(), field, *size, cast_options)
         }
@@ -3071,12 +3086,18 @@ fn cast_from_decimal<D, F>(
 ) -> Result<ArrayRef, ArrowError>
 where
     D: DecimalType + ArrowPrimitiveType,
-    <D as ArrowPrimitiveType>::Native: ToPrimitive,
+    <D as ArrowPrimitiveType>::Native: ToPrimitive + CppToReal,
     F: Fn(D::Native) -> f64,
 {
     use DataType::*;
     // cast decimal to other type
     match to_type {
+        Float32 if cast_options.conversion.is_some() => {
+            Ok(conversion_decimal_to_real::<D, Float32Type>(array, *scale))
+        }
+        Float64 if cast_options.conversion.is_some() => {
+            Ok(conversion_decimal_to_real::<D, Float64Type>(array, *scale))
+        }
         UInt8 => cast_decimal_to_integer::<D, UInt8Type>(array, base, *scale, cast_options),
         UInt16 => cast_decimal_to_integer::<D, UInt16Type>(array, base, *scale, cast_options),
         UInt32 => cast_decimal_to_integer::<D, UInt32Type>(array, base, *scale, cast_options),

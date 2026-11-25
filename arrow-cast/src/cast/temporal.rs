@@ -234,11 +234,43 @@ fn localized_timestamp(
 /// Returns [`ArrowError::CastError`] for a name that is not a time zone.
 pub(crate) fn zone(tz: Option<&str>) -> Result<Option<Tz>, ArrowError> {
     tz.map(|tz| {
-        tz.parse::<Tz>().map_err(|error| {
+        let refused = |error: String| {
             ArrowError::CastError(format!("Cannot locate or parse timezone '{tz}': {error}"))
-        })
+        };
+        match tz.strip_prefix(['+', '-']) {
+            Some(offset) => {
+                let (hours, minutes) =
+                    cpp_offset(tz.len(), offset).ok_or_else(|| refused("not an offset".into()))?;
+                format!("{}{hours:02}:{minutes:02}", &tz[..1]).parse::<Tz>()
+            }
+            None => tz.parse::<Tz>(),
+        }
+        .map_err(|error| refused(error.to_string()))
     })
     .transpose()
+}
+
+/// The hours and minutes of the offset of the zone `+offset` or `-offset`,
+/// `len` characters long, as Arrow C++ `LocateZone` reads them: `HH:MM` in
+/// six characters, else the first four characters as `HHMM` in five or six,
+/// with fewer than 24 hours and 60 minutes.
+fn cpp_offset(len: usize, offset: &str) -> Option<(u8, u8)> {
+    let number = |range: std::ops::Range<usize>| {
+        let digits = offset.get(range)?;
+        digits
+            .bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| digits.parse::<u8>().ok())?
+    };
+    let colon = len == 6 && offset.as_bytes().get(2) == Some(&b':');
+    let parsed = match (colon, number(0..2), number(3..5)) {
+        (true, Some(hours), Some(minutes)) if hours < 24 && minutes < 60 => Some((hours, minutes)),
+        _ => None,
+    };
+    parsed.or_else(|| match (len, number(0..2), number(2..4)) {
+        (5 | 6, Some(hours), Some(minutes)) if hours < 24 && minutes < 60 => Some((hours, minutes)),
+        _ => None,
+    })
 }
 
 /// The offset from UTC in seconds of `tz` at the instant `value`, counted in

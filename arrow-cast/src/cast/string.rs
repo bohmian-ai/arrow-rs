@@ -693,11 +693,23 @@ fn formatted(array: &dyn Array, to_type: &DataType) -> Result<Option<ArrayRef>, 
         let array = array.as_primitive::<T>();
         Box::new(move |i, out| write!(out, "{}", array.value(i)).expect("writes to a String"))
     }
-    fn decimal<T: ArrowPrimitiveType>(array: &dyn Array, scale: i8) -> Format<'_>
+    fn decimal<T: DecimalType>(array: &dyn Array, scale: i8) -> Format<'_>
     where
         T::Native: std::fmt::Display,
     {
         let array = array.as_primitive::<T>();
+        // C++ `Decimal*::ToString` formats a scale beyond the type's
+        // maximum, either way, as this sentinel.
+        if scale.unsigned_abs() > T::MAX_SCALE as u8 {
+            return Box::new(move |_, out| {
+                write!(
+                    out,
+                    "<scale out of range, cannot format {} value>",
+                    T::PREFIX
+                )
+                .expect("writes to a String")
+            });
+        }
         Box::new(move |i, out| {
             write!(out, "{}", array.value(i)).expect("writes to a String");
             adjust_integer_string_with_scale(scale as i32, out);

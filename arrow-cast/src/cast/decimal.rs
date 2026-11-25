@@ -827,6 +827,17 @@ pub(crate) trait WrappingDecimal: ArrowNativeTypeOp {
     fn widen(self) -> i256;
     /// The low bits of `value`.
     fn wrap(value: i256) -> Self;
+    /// Arrow C++ `FitsInPrecision` against `bound`, ten to the precision:
+    /// the magnitude below the bound, where Decimal32 and Decimal64 refuse
+    /// their minimum and Decimal128 and Decimal256 negate it, wrapping.
+    fn fits(self, bound: Self) -> bool {
+        let magnitude = if self.is_lt(Self::ZERO) {
+            self.neg_wrapping()
+        } else {
+            self
+        };
+        magnitude.is_lt(bound)
+    }
 }
 
 impl WrappingDecimal for i32 {
@@ -836,6 +847,9 @@ impl WrappingDecimal for i32 {
     fn wrap(value: i256) -> Self {
         value.as_i128() as i32
     }
+    fn fits(self, bound: Self) -> bool {
+        self != i32::MIN && self.abs() < bound
+    }
 }
 
 impl WrappingDecimal for i64 {
@@ -844,6 +858,9 @@ impl WrappingDecimal for i64 {
     }
     fn wrap(value: i256) -> Self {
         value.as_i128() as i64
+    }
+    fn fits(self, bound: Self) -> bool {
+        self != i64::MIN && self.abs() < bound
     }
 }
 
@@ -1012,12 +1029,7 @@ fn checked_rescale<W: WrappingDecimal>(
             "Rescaling decimal value {v:?} from scale {in_scale} to scale {scale} would cause data loss"
         ))
     })?;
-    let magnitude = if rescaled.is_lt(W::ZERO) {
-        rescaled.neg_wrapping()
-    } else {
-        rescaled
-    };
-    if !magnitude.is_lt(bound) {
+    if !rescaled.fits(bound) {
         return Err(ArrowError::CastError(format!(
             "Decimal value {rescaled:?} does not fit in precision {precision}"
         )));
@@ -1234,9 +1246,14 @@ where
     Ok(Arc::new(array))
 }
 
-/// A floating point type Arrow C++ converts to decimals with `FromReal`.
+/// A floating point type Arrow C++ converts to decimals with `FromReal` and
+/// from decimals with `ToReal`.
 pub(crate) trait CppReal:
-    ArrowNativeType + PartialOrd + std::ops::Mul<Output = Self> + std::ops::Neg<Output = Self>
+    ArrowNativeType
+    + PartialOrd
+    + std::ops::Add<Output = Self>
+    + std::ops::Mul<Output = Self>
+    + std::ops::Neg<Output = Self>
 {
     /// Bits of the significand, including the implicit bit.
     const MANTISSA_BITS: i32;
@@ -1248,6 +1265,23 @@ pub(crate) trait CppReal:
     fn nearbyint(self) -> Self;
     /// The value, exactly.
     fn widen(self) -> f64;
+    /// The integer, rounded to nearest.
+    fn from_i64(x: i64) -> Self;
+    /// The integer, rounded to nearest.
+    fn from_u64(x: u64) -> Self;
+    /// `x * 2^64`, `x * 2^128` and `x * 2^192` as Arrow C++ `RealTraits`
+    /// computes them; for `f32` the latter two are infinite unless `x` is 0.
+    fn two_to(x: Self, exp: i32) -> Self;
+}
+
+/// `10 ^ exp` as Arrow C++ `LargePowerOfTen` returns it: from its table
+/// within 76, otherwise by `pow`.
+fn large_power_of_ten<R: CppReal + num_traits::Float>(exp: i32) -> R {
+    if (-76..=76).contains(&exp) {
+        R::power_of_ten(exp)
+    } else {
+        R::from_i64(10).powi(exp)
+    }
 }
 
 impl CppReal for f32 {
@@ -1263,6 +1297,19 @@ impl CppReal for f32 {
     }
     fn widen(self) -> f64 {
         self as f64
+    }
+    fn from_i64(x: i64) -> Self {
+        x as f32
+    }
+    fn from_u64(x: u64) -> Self {
+        x as f32
+    }
+    fn two_to(x: Self, exp: i32) -> Self {
+        match exp {
+            64 => x * 1.8446744e19,
+            _ if x == 0.0 => 0.0,
+            _ => f32::INFINITY,
+        }
     }
 }
 
@@ -1280,6 +1327,155 @@ impl CppReal for f64 {
     fn widen(self) -> f64 {
         self
     }
+    fn from_i64(x: i64) -> Self {
+        x as f64
+    }
+    fn from_u64(x: u64) -> Self {
+        x as f64
+    }
+    fn two_to(x: Self, exp: i32) -> Self {
+        match exp {
+            64 => x * 1.8446744073709552e19,
+            128 => x * 3.402823669209385e38,
+            _ => x * 6.277101735386681e57,
+        }
+    }
+}
+
+/// A decimal native Arrow C++ converts to floating point with
+/// `DecimalRealConversion::ToReal`.
+pub(crate) trait CppToReal: Copy {
+    /// Whether the value is negative.
+    fn is_negative(self) -> bool;
+    /// The negated value, wrapping.
+    fn negate(self) -> Self;
+    /// Whether the non-negative value is at most `max`, so that C++ does not
+    /// split it into whole and fraction; Decimal256 requires less than `max`.
+    fn precise(self, max: u64) -> bool;
+    /// The quotient and remainder of the non-negative value by `10 ^ scale`.
+    fn whole_and_fraction(self, scale: i8) -> (Self, Self);
+    /// The non-negative value as C++ `ToRealPositiveNoSplit` sums it, before
+    /// the power of ten.
+    fn to_real<R: CppReal>(self) -> R;
+}
+
+impl CppToReal for i32 {
+    fn is_negative(self) -> bool {
+        self < 0
+    }
+    fn negate(self) -> Self {
+        self.wrapping_neg()
+    }
+    fn precise(self, max: u64) -> bool {
+        self as i64 as u64 <= max
+    }
+    fn whole_and_fraction(self, scale: i8) -> (Self, Self) {
+        let power = 10_i32.wrapping_pow(scale as u32);
+        (self.wrapping_div(power), self.wrapping_rem(power))
+    }
+    fn to_real<R: CppReal>(self) -> R {
+        R::from_i64(self as i64)
+    }
+}
+
+impl CppToReal for i64 {
+    fn is_negative(self) -> bool {
+        self < 0
+    }
+    fn negate(self) -> Self {
+        self.wrapping_neg()
+    }
+    fn precise(self, max: u64) -> bool {
+        self as u64 <= max
+    }
+    fn whole_and_fraction(self, scale: i8) -> (Self, Self) {
+        let power = 10_i64.wrapping_pow(scale as u32);
+        (self.wrapping_div(power), self.wrapping_rem(power))
+    }
+    fn to_real<R: CppReal>(self) -> R {
+        R::from_i64(self)
+    }
+}
+
+impl CppToReal for i128 {
+    fn is_negative(self) -> bool {
+        self < 0
+    }
+    fn negate(self) -> Self {
+        self.wrapping_neg()
+    }
+    fn precise(self, max: u64) -> bool {
+        (self >> 64) == 0 && self as u64 <= max
+    }
+    fn whole_and_fraction(self, scale: i8) -> (Self, Self) {
+        let power = 10_i128.wrapping_pow(scale as u32);
+        (self.wrapping_div(power), self.wrapping_rem(power))
+    }
+    fn to_real<R: CppReal>(self) -> R {
+        R::two_to(R::from_i64((self >> 64) as i64), 64) + R::from_u64(self as u64)
+    }
+}
+
+impl CppToReal for i256 {
+    fn is_negative(self) -> bool {
+        self < i256::ZERO
+    }
+    fn negate(self) -> Self {
+        self.wrapping_neg()
+    }
+    fn precise(self, max: u64) -> bool {
+        let (low, high) = self.to_parts();
+        high == 0 && (low >> 64) == 0 && (low as u64) < max
+    }
+    fn whole_and_fraction(self, scale: i8) -> (Self, Self) {
+        let power = i256::from_i128(10).wrapping_pow(scale as u32);
+        (self.wrapping_div(power), self.wrapping_rem(power))
+    }
+    fn to_real<R: CppReal>(self) -> R {
+        let (low, high) = self.to_parts();
+        let parts = [
+            low as u64,
+            (low >> 64) as u64,
+            high as u64,
+            (high >> 64) as u64,
+        ];
+        let mut x = R::from_i64(0);
+        x = x + R::two_to(R::from_u64(parts[3]), 192);
+        x = x + R::two_to(R::from_u64(parts[2]), 128);
+        x = x + R::two_to(R::from_u64(parts[1]), 64);
+        x + R::from_u64(parts[0])
+    }
+}
+
+/// Converts decimal values of `scale` to the floating point type `R` as
+/// Arrow C++ `DecimalRealConversion::ToReal` does: the magnitude, multiplied
+/// by `10 ^ -scale` in `R`, split into whole and fraction when it is not an
+/// integer `R` holds exactly, and then signed.
+pub(crate) fn conversion_decimal_to_real<D, R>(array: &dyn Array, scale: i8) -> ArrayRef
+where
+    D: DecimalType,
+    D::Native: CppToReal,
+    R: ArrowPrimitiveType,
+    R::Native: CppReal + num_traits::Float,
+{
+    let power: R::Native = large_power_of_ten(-(scale as i32));
+    let max = (1_u64 << R::Native::MANTISSA_BITS) - 1;
+    let positive = |x: D::Native| -> R::Native {
+        if scale <= 0 || x.precise(max) {
+            return x.to_real::<R::Native>() * power;
+        }
+        let (whole, fraction) = x.whole_and_fraction(scale);
+        whole.to_real::<R::Native>() * R::Native::from_i64(1)
+            + fraction.to_real::<R::Native>() * power
+    };
+    let array = array.as_primitive::<D>().unary::<_, R>(|x| {
+        if x.is_negative() {
+            -positive(x.negate())
+        } else {
+            positive(x)
+        }
+    });
+    Arc::new(array)
 }
 
 /// `ceil(log2(10 ^ k))` for `k` in `0..=76`, as Arrow C++ tabulates it.
