@@ -233,7 +233,8 @@ fn localized_timestamp(
 ///
 /// Returns [`ArrowError::CastError`] for a name that is not a time zone.
 pub(crate) fn zone(tz: Option<&str>) -> Result<Option<Tz>, ArrowError> {
-    tz.map(|tz| {
+    // Arrow C++ reads an empty time zone as none.
+    tz.filter(|tz| !tz.is_empty()).map(|tz| {
         let refused = |error: String| {
             ArrowError::CastError(format!("Cannot locate or parse timezone '{tz}': {error}"))
         };

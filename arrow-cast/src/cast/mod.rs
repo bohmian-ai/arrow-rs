@@ -9020,6 +9020,20 @@ mod tests {
         }
     }
 
+    /// Arrow C++ reads an empty time zone as no time zone.
+    #[test]
+    fn test_conversion_cast_empty_zone_is_no_zone() {
+        let zoned = TimestampSecondArray::from(vec![86_400]).with_timezone("");
+        let text =
+            cast_with_conversion_options(&zoned, &DataType::Utf8, &ConversionOptions::SAFE)
+                .unwrap();
+        assert_eq!(text.as_string::<i32>().value(0), "1970-01-02 00:00:00");
+        let date =
+            cast_with_conversion_options(&zoned, &DataType::Date32, &ConversionOptions::SAFE)
+                .unwrap();
+        assert_eq!(date.as_primitive::<Date32Type>().value(0), 1);
+    }
+
     /// A rescale by more digits than any width holds, which Arrow C++ leaves
     /// undefined, refuses or converts without panicking.
     #[test]
