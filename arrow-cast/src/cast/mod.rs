@@ -862,7 +862,11 @@ pub struct ConversionOptions {
     /// Permit a floating point value to be truncated to an integer, and an
     /// integer to lose precision when converted to a floating point type.
     pub allow_float_truncate: bool,
-    /// Permit binary values that are not valid UTF-8 to become strings.
+    /// Arrow C++ `allow_invalid_utf8`, which lets binary values that are not
+    /// valid UTF-8 become strings that fail full validation. A Rust string
+    /// array must hold valid UTF-8, which `StringArray::value` relies on
+    /// without checking, so such a value is refused whatever this flag is,
+    /// unlike Arrow C++.
     pub allow_invalid_utf8: bool,
 }
 

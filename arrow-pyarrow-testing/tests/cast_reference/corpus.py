@@ -122,7 +122,6 @@ class Case:
         self.expect = expect
         self.label = label
         self.variants = variants
-        self.divergence = None
 
 
 def check(input, expected, label="", **options):
@@ -143,22 +142,6 @@ def type_error(input, to, label="", **options):
 
 def attempt(input, to, label="", **options):
     return Case(input, to, options, None, label or "attempt")
-
-
-# Why a Rust outcome may differ from Arrow C++, by divergence.
-INVALID_UTF8_STRINGS = (
-    "A Rust string array must hold UTF-8 (`StringArray::value` relies on it "
-    "without checking), so a conversion of binary that Arrow C++ lets produce "
-    "invalid UTF-8 under allow_invalid_utf8 is refused instead."
-)
-
-
-def diverges(input, to, reason, **options):
-    """A cast Rust refuses as `Invalid` where Arrow C++ converts, for `reason`.
-    Only the whole array executes: its variants are separate cases."""
-    case = Case(input, to, options, None, "diverges", variants=False)
-    case.divergence = reason
-    return case
 
 
 _REGISTRY = []
@@ -1068,7 +1051,10 @@ def _():
             yield check(pa.array([], bin_type), pa.array([], string_type))
             yield check(mask_nulls_at(invalid_utf8(bin_type), [4]), mask_nulls_at(invalid_utf8(string_type), [4]))
             yield fails(invalid_utf8(bin_type), string_type)
-            yield diverges(invalid_utf8(bin_type), string_type, INVALID_UTF8_STRINGS, allow_invalid_utf8=True)
+            # Arrow C++ converts to strings that fail ValidateFull, which a
+            # Rust string array cannot hold: see ConversionOptions::allow_invalid_utf8.
+            yield attempt(invalid_utf8(bin_type), string_type, "allow invalid utf8", allow_invalid_utf8=True)
+            yield attempt(invalid_utf8(bin_type), string_type, "unsafe", **UNSAFE)
     from_type = pa.binary(3)
     for string_type in STRING_TYPES:
         yield check(pa.array([], from_type), pa.array([], string_type))
@@ -1077,7 +1063,8 @@ def _():
             mask_nulls_at(invalid_utf8(string_type, FIXED_SIZE_INVALID_UTF8), [4]),
         )
         yield fails(invalid_utf8(from_type, FIXED_SIZE_INVALID_UTF8), string_type)
-        yield diverges(invalid_utf8(from_type, FIXED_SIZE_INVALID_UTF8), string_type, INVALID_UTF8_STRINGS, allow_invalid_utf8=True)
+        yield attempt(invalid_utf8(from_type, FIXED_SIZE_INVALID_UTF8), string_type, "allow invalid utf8", allow_invalid_utf8=True)
+        yield attempt(invalid_utf8(from_type, FIXED_SIZE_INVALID_UTF8), string_type, "unsafe", **UNSAFE)
 
 
 @cpp_test("BinaryOrStringToBinary")

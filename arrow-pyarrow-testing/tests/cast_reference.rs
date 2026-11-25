@@ -45,8 +45,8 @@ use pyo3::types::{PyDict, PyList};
 
 /// One execution of `harness.executions`: the C++ test, case, variant, input,
 /// the fields of the input, target and reference result types, option flags,
-/// reference status, reference result, reference message, translation error
-/// and recorded divergence.
+/// reference status, reference result, reference message and translation
+/// error.
 type Execution<'py> = (
     String,
     String,
@@ -57,7 +57,6 @@ type Execution<'py> = (
     String,
     Option<Bound<'py, PyAny>>,
     String,
-    Option<String>,
     Option<String>,
 );
 
@@ -129,30 +128,6 @@ fn mismatch(
     }
 }
 
-/// Why the Rust outcome of a recorded divergence is not the refusal it records,
-/// if it is not: Arrow C++ must convert and Rust must refuse as `Invalid`.
-fn diverged(
-    rust: &Result<ArrayData, ArrowError>,
-    kind: &str,
-    message: &str,
-    reason: &str,
-) -> Option<String> {
-    match rust {
-        _ if kind != "ok" => Some(format!(
-            "divergence ({reason}) no longer holds: reference refused with {kind}: {message}"
-        )),
-        Err(error) if category(error) == "Invalid" => None,
-        Err(error) => Some(format!(
-            "divergence refused as {} ({error})",
-            category(error)
-        )),
-        Ok(actual) => Some(format!(
-            "divergence ({reason}) converted to {:?}",
-            make_array(actual.clone())
-        )),
-    }
-}
-
 /// The extension type a field carries: its name and metadata.
 fn extension(field: &Field) -> (Option<&str>, Option<&str>) {
     (field.extension_type_name(), field.extension_type_metadata())
@@ -182,7 +157,6 @@ fn cast_matches_arrow_cpp_reference() {
     Python::initialize();
     let mut report = String::new();
     let mut failures = Vec::new();
-    let mut divergences = Vec::new();
     let mut executions = 0;
     Python::attach(|py| -> PyResult<()> {
         let directory = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/cast_reference");
@@ -198,7 +172,7 @@ fn cast_matches_arrow_cpp_reference() {
 
         for execution in harness.call_method0("executions")?.try_iter()? {
             let execution = execution?;
-            let (test, case, variant, input, (from_field, to_field, result_field), flags, kind, result, message, translation, divergence): Execution =
+            let (test, case, variant, input, (from_field, to_field, result_field), flags, kind, result, message, translation): Execution =
                 execution.extract()?;
             executions += 1;
             let input = ArrayData::from_pyarrow_bound(&input)?;
@@ -219,14 +193,8 @@ fn cast_matches_arrow_cpp_reference() {
                 Ok(_) => "ok".to_string(),
                 Err(error) => category(error),
             };
-            let difference = match &divergence {
-                Some(reason) => diverged(&rust, &kind, &message, reason),
-                None => mismatch(&rust, &kind, reference.as_ref(), &message)
-                    .or_else(|| identity_mismatch(&rust, &to_field, result_field.as_ref())),
-            };
-            if let (Some(reason), None) = (&divergence, &difference) {
-                divergences.push(format!("{case}: {reason}"));
-            }
+            let difference = mismatch(&rust, &kind, reference.as_ref(), &message)
+                .or_else(|| identity_mismatch(&rust, &to_field, result_field.as_ref()));
             writeln!(
                 report,
                 "{case} [{variant}] to {to} with {options:?}: reference {kind}, rust {rust_outcome}{}",
@@ -252,12 +220,6 @@ fn cast_matches_arrow_cpp_reference() {
 
     if let Ok(path) = std::env::var("CAST_REFERENCE_REPORT") {
         std::fs::write(path, &report).expect("the report path is writable");
-    }
-    if !divergences.is_empty() {
-        println!(
-            "Recorded divergences from Arrow C++:\n{}",
-            divergences.join("\n")
-        );
     }
     assert!(executions > 0, "the corpus executed no cases");
     assert!(

@@ -144,9 +144,7 @@ def executions():
     """Every execution of the corpus as a tuple of the C++ test, case identity,
     variant, input, the fields of the input, target and reference result
     types, option flags, reference status, reference result, reference
-    message, any disagreement with the C++
-    test's expectation, and the reason Rust is expected to refuse as `Invalid`
-    where Arrow C++ converts, if it is. A field carries an extension type as
+    message and any disagreement with the C++ test's expectation. A field carries an extension type as
     its metadata, which the C Data Interface keeps and the array drops."""
     for test, number, case in corpus.cases():
         flags = {flag: bool(case.options.get(flag, False)) for flag in FLAGS}
@@ -168,7 +166,6 @@ def executions():
                 value if kind == "ok" else None,
                 str(value) if kind != "ok" else "",
                 translation,
-                case.divergence,
             )
 
 
