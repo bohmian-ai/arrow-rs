@@ -52,7 +52,11 @@ type Execution<'py> = (
     String,
     String,
     Bound<'py, PyAny>,
-    (Bound<'py, PyAny>, Bound<'py, PyAny>, Option<Bound<'py, PyAny>>),
+    (
+        Bound<'py, PyAny>,
+        Bound<'py, PyAny>,
+        Option<Bound<'py, PyAny>>,
+    ),
     Bound<'py, PyDict>,
     String,
     Option<Bound<'py, PyAny>>,
@@ -168,7 +172,11 @@ fn identity_mismatch(
 /// Whether a difference is the one an approved exception permits: Arrow C++
 /// converts and Rust refuses as `Invalid` or, when the exception names an
 /// `approved` result, returns exactly that result.
-fn excepted(rust: &Result<ArrayData, ArrowError>, kind: &str, approved: Option<&ArrayData>) -> bool {
+fn excepted(
+    rust: &Result<ArrayData, ArrowError>,
+    kind: &str,
+    approved: Option<&ArrayData>,
+) -> bool {
     kind == "ok"
         && match approved {
             Some(approved) => rust.is_ok() && mismatch(rust, "ok", Some(approved), "").is_none(),
