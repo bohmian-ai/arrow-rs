@@ -167,6 +167,14 @@ UNREPRESENTABLE_LOCAL_TIME = (
     "approved exception: Arrow C++ wraps a local day beyond 32 bits or a zone "
     "offset beyond the calendar range, so Rust refuses"
 )
+UNSELECTED_LIST_VALUES = (
+    "approved exception: Arrow C++ converts a fixed size list's whole child and "
+    "refuses an invalid value no row selects; Rust arrays do not keep it"
+)
+WRAPPED_ZONED_YEARS = (
+    "approved exception: Arrow C++ wraps a far zoned timestamp's year into "
+    "range and prints wrapped text, so Rust refuses"
+)
 BUNDLED_ZONES = (
     "approved exception: Rust resolves zones through its bundled database, "
     "which has no host zone such as localtime, so Rust refuses"
@@ -176,8 +184,8 @@ BUNDLED_ZONES = (
 def excepted(input, to, label, reason, result=None, variants=True, **options):
     """A C++ cast for which an approved exception, for `reason`, lets Rust
     refuse as `Invalid` where Arrow C++ converts or, given `result`, return
-    exactly `result` instead of the C++ result. Any other difference is still
-    a disagreement."""
+    exactly `result` instead of the C++ result or refusal. Any other
+    difference is still a disagreement."""
     case = Case(input, to, options, None, label, variants)
     case.exception = reason
     case.exception_result = result
@@ -2130,7 +2138,7 @@ _REGISTRY.append(("ErrorCategories", error_categories))
 
 
 def approved_exceptions():
-    """Beyond the C++ tests: the approved exceptions of revision 14."""
+    """Beyond the C++ tests: the approved exceptions of revisions 14 and 15."""
     maps = pa.array([[(1, None), (2, 3)]], pa.map_(pa.int32(), pa.int32()))
     yield excepted(maps, pa.map_(pa.int32(), pa.field("value", pa.int32(), nullable=False)), "null map value to a non-nullable value", NON_NULLABLE_NULLS, variants=False)
     yield attempt(pa.array([[(1, 2)]], pa.map_(pa.int32(), pa.int32())), pa.map_(pa.int32(), pa.field("value", pa.int32(), nullable=False)), "map value to a non-nullable value")
@@ -2148,6 +2156,14 @@ def approved_exceptions():
             yield excepted(pa.array([value, None], pa.timestamp(unit, "+05:00")), target, f"{value} {unit} in +05:00 to {target}", UNREPRESENTABLE_LOCAL_TIME, variants=False)
     for target in [pa.date32(), pa.time32("s"), pa.utf8()]:
         yield excepted(pa.array([0, None], pa.timestamp("s", "localtime")), target, f"timestamp in localtime to {target}", BUNDLED_ZONES, variants=False)
+    trailing = pa.FixedSizeListArray.from_arrays(pa.array(["1", "x"]), 1).slice(0, 1)
+    for target in [pa.list_(pa.int32(), 1), pa.list_(pa.int32()), pa.large_list(pa.int32())]:
+        yield excepted(trailing, target, f"unselected trailing 'x' to {target}", UNSELECTED_LIST_VALUES, result=pa.array([[1]], target), variants=False)
+    leading = pa.FixedSizeListArray.from_arrays(pa.array(["x", "1"]), 1).slice(1, 1)
+    target = pa.list_(pa.int32(), 1)
+    yield excepted(leading, target, f"unselected leading 'x' to {target}", UNSELECTED_LIST_VALUES, result=pa.array([[1]], target), variants=False)
+    for value in [2**50, 2**62, -(2**62)]:
+        yield excepted(pa.array([value, None], pa.timestamp("s", "+05:30")), pa.utf8(), f"{value} s in +05:30 to string", WRAPPED_ZONED_YEARS)
 
 
 _REGISTRY.append(("ApprovedExceptions", approved_exceptions))

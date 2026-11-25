@@ -171,17 +171,17 @@ fn identity_mismatch(
 
 /// Whether a difference is the one an approved exception permits: Arrow C++
 /// converts and Rust refuses as `Invalid` or, when the exception names an
-/// `approved` result, returns exactly that result.
+/// `approved` result, Rust returns exactly that result whatever Arrow C++
+/// returns.
 fn excepted(
     rust: &Result<ArrayData, ArrowError>,
     kind: &str,
     approved: Option<&ArrayData>,
 ) -> bool {
-    kind == "ok"
-        && match approved {
-            Some(approved) => rust.is_ok() && mismatch(rust, "ok", Some(approved), "").is_none(),
-            None => matches!(rust, Err(error) if category(error) == "Invalid"),
-        }
+    match approved {
+        Some(approved) => rust.is_ok() && mismatch(rust, "ok", Some(approved), "").is_none(),
+        None => kind == "ok" && matches!(rust, Err(error) if category(error) == "Invalid"),
+    }
 }
 
 #[test]
