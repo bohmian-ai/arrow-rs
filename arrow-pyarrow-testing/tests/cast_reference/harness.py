@@ -142,10 +142,12 @@ def translation_error(case, reference):
 
 def executions():
     """Every execution of the corpus as a tuple of the C++ test, case identity,
-    variant, input, target type, option flags, reference status, reference
-    message or result, any disagreement with the C++ test's expectation, and
-    the reason Rust is expected to refuse as `Invalid` where Arrow C++
-    converts, if it is."""
+    variant, input, the fields of the input, target and reference result
+    types, option flags, reference status, reference result, reference
+    message, any disagreement with the C++
+    test's expectation, and the reason Rust is expected to refuse as `Invalid`
+    where Arrow C++ converts, if it is. A field carries an extension type as
+    its metadata, which the C Data Interface keeps and the array drops."""
     for test, number, case in corpus.cases():
         flags = {flag: bool(case.options.get(flag, False)) for flag in FLAGS}
         for variant, array, reference in variants(case):
@@ -156,7 +158,11 @@ def executions():
                 f"{test}#{number} {case.label}",
                 variant,
                 array,
-                case.to,
+                (
+                    pa.field("", array.type),
+                    pa.field("", case.to),
+                    pa.field("", value.type) if kind == "ok" else None,
+                ),
                 flags,
                 kind,
                 value if kind == "ok" else None,

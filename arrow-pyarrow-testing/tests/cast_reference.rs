@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Compares [`cast_with_conversion_options`] with the Apache Arrow C++ 24.0.0
+//! Compares [`cast_field_with_conversion_options`] with the Apache Arrow C++ 24.0.0
 //! cast operation on identical inputs.
 //!
 //! `cast_reference/corpus.py` translates the C++ cast tests of
@@ -26,8 +26,8 @@
 //! input of every execution crosses the C Data Interface unchanged, so slice
 //! offsets, unreferenced dictionary values and the children of null parents
 //! reach both engines. Each execution must agree on success or refusal, the
-//! status category of a refusal, and the type, length, values and validity of
-//! a result.
+//! status category of a refusal, the type, length, values and validity of a
+//! result, and its extension type, which a field carries as metadata.
 //!
 //! Requires a Python interpreter with `pyarrow==24.0.0`, as the other tests
 //! of this crate do. Set `CAST_REFERENCE_REPORT` to a path to write every
@@ -36,22 +36,23 @@
 use std::fmt::Write as _;
 
 use arrow_array::{Array, make_array};
-use arrow_cast::{ConversionOptions, cast_with_conversion_options};
+use arrow_cast::{ConversionOptions, cast_field_with_conversion_options};
 use arrow_data::ArrayData;
 use arrow_pyarrow::FromPyArrow;
-use arrow_schema::{ArrowError, DataType};
+use arrow_schema::{ArrowError, Field};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 /// One execution of `harness.executions`: the C++ test, case, variant, input,
-/// target type, option flags, reference status, reference result, reference
-/// message, translation error and recorded divergence.
+/// the fields of the input, target and reference result types, option flags,
+/// reference status, reference result, reference message, translation error
+/// and recorded divergence.
 type Execution<'py> = (
     String,
     String,
     String,
     Bound<'py, PyAny>,
-    Bound<'py, PyAny>,
+    (Bound<'py, PyAny>, Bound<'py, PyAny>, Option<Bound<'py, PyAny>>),
     Bound<'py, PyDict>,
     String,
     Option<Bound<'py, PyAny>>,
@@ -152,6 +153,30 @@ fn diverged(
     }
 }
 
+/// The extension type a field carries: its name and metadata.
+fn extension(field: &Field) -> (Option<&str>, Option<&str>) {
+    (field.extension_type_name(), field.extension_type_metadata())
+}
+
+/// Why the extension type of a Rust result, which is that of the target
+/// field, differs from the extension type of the reference result, if it does.
+fn identity_mismatch(
+    rust: &Result<ArrayData, ArrowError>,
+    to: &Field,
+    reference: Option<&Field>,
+) -> Option<String> {
+    let (Ok(_), Some(reference)) = (rust, reference) else {
+        return None;
+    };
+    (extension(to) != extension(reference)).then(|| {
+        format!(
+            "extension type {:?} != reference {:?}",
+            extension(to),
+            extension(reference)
+        )
+    })
+}
+
 #[test]
 fn cast_matches_arrow_cpp_reference() {
     Python::initialize();
@@ -173,16 +198,22 @@ fn cast_matches_arrow_cpp_reference() {
 
         for execution in harness.call_method0("executions")?.try_iter()? {
             let execution = execution?;
-            let (test, case, variant, input, to, flags, kind, result, message, translation, divergence): Execution =
+            let (test, case, variant, input, (from_field, to_field, result_field), flags, kind, result, message, translation, divergence): Execution =
                 execution.extract()?;
             executions += 1;
             let input = ArrayData::from_pyarrow_bound(&input)?;
-            let to = DataType::from_pyarrow_bound(&to)?;
+            let from_field = Field::from_pyarrow_bound(&from_field)?;
+            let to_field = Field::from_pyarrow_bound(&to_field)?;
+            let to = to_field.data_type().clone();
             let options = conversion_options(&flags)?;
             let reference = result
                 .map(|result| ArrayData::from_pyarrow_bound(&result))
                 .transpose()?;
-            let rust = cast_with_conversion_options(&make_array(input), &to, &options)
+            let result_field = result_field
+                .map(|field| Field::from_pyarrow_bound(&field))
+                .transpose()?;
+            let rust =
+                cast_field_with_conversion_options(&make_array(input), &from_field, &to_field, &options)
                 .map(|array| array.to_data());
             let rust_outcome = match &rust {
                 Ok(_) => "ok".to_string(),
@@ -190,7 +221,8 @@ fn cast_matches_arrow_cpp_reference() {
             };
             let difference = match &divergence {
                 Some(reason) => diverged(&rust, &kind, &message, reason),
-                None => mismatch(&rust, &kind, reference.as_ref(), &message),
+                None => mismatch(&rust, &kind, reference.as_ref(), &message)
+                    .or_else(|| identity_mismatch(&rust, &to_field, result_field.as_ref())),
             };
             if let (Some(reason), None) = (&divergence, &difference) {
                 divergences.push(format!("{case}: {reason}"));

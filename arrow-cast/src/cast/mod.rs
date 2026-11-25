@@ -924,6 +924,61 @@ pub fn cast_with_conversion_options(
     )
 }
 
+/// Cast `array`, of the type and extension type of `from`, to the type and
+/// extension type of `to`, as [`cast_with_conversion_options`] does.
+///
+/// An Arrow extension type is the field metadata
+/// [`EXTENSION_TYPE_NAME_KEY`](arrow_schema::extension::EXTENSION_TYPE_NAME_KEY)
+/// and [`EXTENSION_TYPE_METADATA_KEY`](arrow_schema::extension::EXTENSION_TYPE_METADATA_KEY)
+/// over a storage type, so `from` and `to` carry what `DataType` does not. As
+/// in Arrow C++, an extension array converts as its storage, a conversion to
+/// an extension type converts to its storage type and the result is of `to`,
+/// and a conversion from one extension type to another is refused. The result
+/// holds the storage of `to`.
+///
+/// # Errors
+///
+/// Returns [`ArrowError::InvalidArgumentError`] when `from` is not of the
+/// type of `array`, [`ArrowError::SchemaError`] (C++ `TypeError`) when both
+/// fields carry extension types that differ, and otherwise the errors of
+/// [`cast_with_conversion_options`].
+pub fn cast_field_with_conversion_options(
+    array: &dyn Array,
+    from: &Field,
+    to: &Field,
+    options: &ConversionOptions,
+) -> Result<ArrayRef, ArrowError> {
+    if array.data_type() != from.data_type() {
+        return Err(ArrowError::InvalidArgumentError(format!(
+            "an array of {} is not of field type {}",
+            array.data_type(),
+            from.data_type()
+        )));
+    }
+    fn extension(field: &Field) -> Option<(&str, Option<&str>)> {
+        field
+            .extension_type_name()
+            .map(|name| (name, field.extension_type_metadata()))
+    }
+    // Arrow C++ does not run the refusing kernel on an empty input.
+    if let (Some(source), Some(target)) = (extension(from), extension(to))
+        && !array.is_empty()
+    {
+        if source == target && from.data_type() == to.data_type() {
+            return Ok(make_array(array.to_data()));
+        }
+        return Err(ArrowError::SchemaError(format!(
+            "Casting from extension type {} over {} to different extension type {} over {} \
+             not permitted. One can first cast to the storage type, then to the extension type.",
+            source.0,
+            from.data_type(),
+            target.0,
+            to.data_type()
+        )));
+    }
+    cast_with_conversion_options(array, to.data_type(), options)
+}
+
 /// The options of one cast and the conversion policy its entry point
 /// selected, passed unchanged through every recursive cast so a nested
 /// conversion applies the same policy as the outer one.
@@ -8548,6 +8603,39 @@ mod tests {
 
         let all_valid: ArrayRef = Arc::new(Int8Array::from(vec![1]));
         assert!(cast(&all_valid, &Int32).nulls().is_none());
+    }
+
+    /// The Arrow C++ `CheckCastZeroCopy` of an extension array to its storage
+    /// type in `ExtensionTypeToIntDowncast`, which the PyArrow comparison of
+    /// `arrow-pyarrow-testing` cannot observe, and a `from` field that does
+    /// not describe the array.
+    #[test]
+    fn extension_casts_reuse_storage() {
+        let extension = |name: &str, data_type: DataType| {
+            Field::new("", data_type, true).with_metadata(std::collections::HashMap::from([(
+                extension::EXTENSION_TYPE_NAME_KEY.to_string(),
+                name.to_string(),
+            )]))
+        };
+        let smallint = extension("smallint", Int16);
+        let storage: ArrayRef = Arc::new(Int16Array::from(vec![Some(0), None, Some(200)]));
+        let options = ConversionOptions::SAFE;
+        for to in [Field::new("", Int16, true), smallint.clone()] {
+            let output =
+                cast_field_with_conversion_options(&storage, &smallint, &to, &options).unwrap();
+            assert!(reuses_buffers(storage.as_ref(), output.as_ref()), "{to}");
+        }
+        let error = cast_field_with_conversion_options(
+            &storage,
+            &Field::new("", Int8, true),
+            &smallint,
+            &options,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, ArrowError::InvalidArgumentError(_)),
+            "{error}"
+        );
     }
 
     #[test]

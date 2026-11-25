@@ -100,19 +100,6 @@ MAPPED_ELSEWHERE = {
     ),
 }
 
-# C++ tests of behavior arrow-cast does not have, and why.
-EXTENSION_TYPES = (
-    "arrow-cast has no extension types: an Arrow extension type is field "
-    "metadata over its storage type, which DataType does not carry, so an "
-    "extension array casts as its storage type."
-)
-LIMITATIONS = {
-    "ExtensionTypeToIntDowncast": EXTENSION_TYPES,
-    "PrimitiveToExtension": EXTENSION_TYPES,
-    "ExtensionDictToExtension": EXTENSION_TYPES,
-    "IntToExtensionTypeDowncast": EXTENSION_TYPES,
-}
-
 UNSAFE = dict(
     allow_int_overflow=True,
     allow_time_truncate=True,
@@ -1500,6 +1487,70 @@ def _():
         yield check(encoded, no_nulls)
 
 
+class _Extension(pa.ExtensionType):
+    """The C++ test extension types `smallint` and `tinyint` of
+    `cpp/src/arrow/testing/extension_type.h`: a name over an integer storage."""
+
+    def __init__(self, storage, name):
+        super().__init__(storage, name)
+
+    def __arrow_ext_serialize__(self):
+        return self.extension_name.encode()
+
+    @classmethod
+    def __arrow_ext_deserialize__(cls, storage_type, serialized):
+        return cls(storage_type, serialized.decode())
+
+
+SMALLINT = _Extension(pa.int16(), "smallint")
+TINYINT = _Extension(pa.int8(), "tinyint")
+
+
+def smallint(text):
+    """C++ `SmallintArrayFromJSON`."""
+    return pa.ExtensionArray.from_storage(SMALLINT, J(pa.int16(), text))
+
+
+def tinyint(text):
+    """C++ `TinyintArrayFromJSON`."""
+    return pa.ExtensionArray.from_storage(TINYINT, J(pa.int8(), text))
+
+
+@cpp_test("ExtensionTypeToIntDowncast")
+def _():
+    yield check(smallint("[0, 100, 200, 1, 2]"), J(pa.int16(), "[0, 100, 200, 1, 2]"), "zero copy")
+    yield check(smallint("[0, 100, 200, 1, 2]"), J(pa.uint8(), "[0, 100, 200, 1, 2]"))
+    yield fails(smallint("[0, null, 256, 1, 3]"), pa.uint8(), "overflow")
+    yield check(smallint("[0, null, 256, 1, 3]"), J(pa.uint8(), "[0, null, 0, 1, 3]"), "overflow", allow_int_overflow=True)
+    yield fails(smallint("[0, null, -1, 1, 3]"), pa.uint8(), "underflow")
+    yield check(smallint("[0, null, -1, 1, 3]"), J(pa.uint8(), "[0, null, 255, 1, 3]"), "underflow", allow_int_overflow=True)
+
+
+@cpp_test("PrimitiveToExtension")
+def _():
+    yield check(J(pa.uint8(), "[0, 1, 3]"), smallint("[0, 1, 3]"))
+    yield fails(J(pa.utf8(), '["hello"]'), SMALLINT)
+
+
+@cpp_test("ExtensionDictToExtension")
+def _():
+    extension = smallint("[1, 2, 1]")
+    encoded = pa.DictionaryArray.from_arrays(J(pa.int32(), "[0, 1, 0]"), extension)
+    yield check(encoded, extension)
+
+
+@cpp_test("IntToExtensionTypeDowncast")
+def _():
+    yield check(J(pa.uint8(), "[0, 100, 200, 1, 2]"), smallint("[0, 100, 200, 1, 2]"))
+    yield fails(J(pa.int32(), "[0, null, 32768, 1, 3]"), SMALLINT, "overflow")
+    yield check(J(pa.int32(), "[0, null, 32768, 1, 3]"), smallint("[0, null, -32768, 1, 3]"), "overflow", allow_int_overflow=True)
+    yield fails(J(pa.int32(), "[0, null, -32769, 1, 3]"), SMALLINT, "underflow")
+    yield check(J(pa.int32(), "[0, null, -32769, 1, 3]"), smallint("[0, null, 32767, 1, 3]"), "underflow", allow_int_overflow=True)
+    # ASSERT_NOT_OK: Arrow C++ refuses an extension of another storage type
+    # as a TypeError.
+    yield type_error(tinyint("[0, 1, 3]"), SMALLINT, "different storage")
+
+
 @cpp_test("DictTypeToAnotherDict")
 def _():
     for in_type, out_type, text in [
@@ -1723,5 +1774,5 @@ def unmapped_tests():
     return [
         name
         for name in CPP_TESTS + SCALAR_CPP_TESTS
-        if name not in translated and name not in MAPPED_ELSEWHERE and name not in LIMITATIONS
+        if name not in translated and name not in MAPPED_ELSEWHERE
     ]
