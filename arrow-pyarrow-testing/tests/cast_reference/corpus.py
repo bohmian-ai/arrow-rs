@@ -1799,6 +1799,202 @@ def extension_context():
 _REGISTRY.append(("ExtensionContext", extension_context))
 
 
+def exact(input, to, label, **options):
+    """A comparison of `input` alone, without the scalar, slice and chunk
+    variants, for an input whose physical layout is the point of the case."""
+    return Case(input, to, options, None, label, variants=False)
+
+
+def list_selection():
+    """Beyond the C++ tests: which child values a list, map and fixed size
+    list conversion evaluates, given the offset of the input and values
+    before the first or after the last list."""
+    for make, to in [(pa.ListArray, pa.list_), (pa.LargeListArray, pa.large_list)]:
+        name = make.__name__
+        prefix = make.from_arrays([0, 1, 2], pa.array(["bad", "2"])).slice(1, 1)
+        for target in [pa.list_(pa.int32()), pa.large_list(pa.int32())]:
+            yield exact(prefix, target, f"sliced {name} past an invalid value to {target}")
+        leading = make.from_arrays([0, 0, 1, 2], pa.array(["2", "bad"])).slice(1, 1)
+        yield exact(leading, to(pa.int32()), f"sliced {name} after an empty list, before an invalid value")
+        tail = make.from_arrays([0, 1], pa.array(["2", "bad"]))
+        yield exact(tail, to(pa.int32()), f"{name} before an unreferenced invalid value")
+        yield exact(tail, pa.list_(pa.int32(), 1), f"{name} before an unreferenced invalid value to a fixed size list")
+        yield exact(prefix, pa.list_(pa.int32(), 1), f"sliced {name} past an invalid value to a fixed size list")
+    view = pa.ListViewArray.from_arrays([1], [1], pa.array(["bad", "2"]))
+    yield exact(view, pa.list_(pa.int32(), 1), "list view past an invalid value to a fixed size list")
+    fixed = pa.FixedSizeListArray.from_arrays(pa.array(["bad", "2"]), 1).slice(1, 1)
+    yield exact(fixed, pa.list_(pa.int32()), "sliced fixed size list past an invalid value to a list")
+    entries = pa.MapArray.from_arrays([0, 1, 2], pa.array(["a", "b"]), pa.array(["bad", "2"]))
+    yield exact(entries.slice(1, 1), pa.map_(pa.utf8(), pa.int32()), "sliced map past an invalid value")
+    pair = pa.list_(pa.struct([("k", pa.utf8()), ("v", pa.int32())]))
+    yield exact(entries.slice(1, 1), pair, "sliced map past an invalid value to a list")
+    tail = pa.MapArray.from_arrays([0, 1], pa.array(["a", "b"]), pa.array(["2", "bad"]))
+    yield exact(tail, pa.map_(pa.utf8(), pa.int32()), "map before an unreferenced invalid value")
+
+
+_REGISTRY.append(("ListSelection", list_selection))
+
+
+def dictionary_encoding():
+    """Beyond the C++ tests: a string or binary cast to a dictionary, which
+    Arrow C++ encodes before it converts the indices and then the values."""
+    distinct = pa.array(["0" * i + "1" for i in range(129)])
+    yield exact(distinct, pa.dictionary(pa.int8(), pa.int32()), "129 spellings of one integer to int8 indices")
+    yield exact(distinct, pa.dictionary(pa.int16(), pa.int32()), "129 spellings of one integer to int16 indices")
+    yield exact(pa.array(["1", "01"]), pa.dictionary(pa.int8(), pa.int32()), "two spellings of one integer")
+    yield attempt(pa.array(["true", None, "false"]), pa.dictionary(pa.int8(), pa.bool_()), "strings to dictionary booleans")
+    yield attempt(pa.array(["2024-01-01"]), pa.dictionary(pa.int8(), pa.date32()), "string to dictionary dates")
+    yield attempt(pa.array([b"1", None, b"2"], pa.large_binary()), pa.dictionary(pa.int8(), pa.int32()), "large binary to dictionary integers")
+    yield attempt(pa.array(["a", "b", None], pa.large_utf8()), pa.dictionary(pa.uint8(), pa.utf8()), "large strings to a dictionary of strings")
+    values = pa.array(["2", "bad"])
+    indices = pa.array([0, None], pa.int8())
+    yield exact(pa.DictionaryArray.from_arrays(indices, values), pa.int32(), "dictionary with an unreferenced invalid value")
+    yield exact(pa.DictionaryArray.from_arrays(indices, values), pa.dictionary(pa.int16(), pa.int32()), "dictionary with an unreferenced invalid value to a dictionary")
+
+
+_REGISTRY.append(("DictionaryEncoding", dictionary_encoding))
+
+
+def nested_types():
+    """Beyond the C++ tests: map sort order, zero width fixed size lists,
+    item nullability, list views and nested types equal but for names."""
+    unsorted = pa.array([[("a", 1)]], pa.map_(pa.utf8(), pa.int32()))
+    yield attempt(unsorted, pa.map_(pa.utf8(), pa.int32(), keys_sorted=True), "map to sorted keys")
+    sorted_keys = unsorted.cast(pa.map_(pa.utf8(), pa.int32(), keys_sorted=True))
+    yield attempt(sorted_keys, pa.map_(pa.utf8(), pa.int64()), "sorted map to unsorted keys")
+    empty_lists = pa.array([[], []], pa.list_(pa.int32(), 0))
+    yield exact(empty_lists, pa.list_(pa.int64(), 0), "zero width fixed size list")
+    yield exact(pa.array([[], []], pa.list_(pa.int32())), pa.list_(pa.int64(), 0), "empty lists to a zero width fixed size list")
+    for make in [pa.list_, pa.large_list]:
+        nulls = pa.array([[None]], make(pa.int32()))
+        yield exact(nulls, make(pa.field("item", pa.int64(), nullable=False)), f"null item of {nulls.type} to a non-nullable item")
+    struct = pa.array([{"x": None}], pa.struct([("x", pa.int32())]))
+    yield exact(struct, pa.struct([pa.field("x", pa.int64(), nullable=False)]), "null field to a non-nullable field")
+    values = pa.array([10, 20, 30, 40], pa.int32())
+    for make, to in [(pa.ListViewArray, pa.list_), (pa.LargeListViewArray, pa.large_list)]:
+        # The backing offsets have a third entry, so the reads of the
+        # sliced view stay in bounds.
+        view = make.from_arrays([0, 2, 3], [1, 1, 1], values).slice(0, 2)
+        yield exact(view, to(pa.int64()), f"sliced {make.__name__} to a list")
+        adjacent = make.from_arrays([0, 1, 2, 3], [1, 1, 1, 1], values)
+        yield exact(adjacent.slice(0, 3), to(pa.int64()), f"{make.__name__} of adjacent lists")
+        yield exact(adjacent.slice(1, 2), to(pa.int64()), f"sliced {make.__name__} of adjacent lists")
+    for make, view in [(pa.ListViewArray, pa.list_view), (pa.LargeListViewArray, pa.large_list_view)]:
+        renamed = make.from_arrays([0], [1], pa.array([7], pa.int32()), type=view(pa.field("source_name", pa.int32())))
+        yield attempt(renamed, view(pa.field("target_name", pa.int32())), f"{renamed.type} to another item name")
+    nested = pa.array([[[7]]], pa.list_(pa.list_view(pa.field("a", pa.int32()))))
+    yield attempt(nested, pa.list_(pa.list_view(pa.field("b", pa.int32()))), "list of list views to another item name")
+    renamed = pa.array([[1]], pa.list_(pa.field("a", pa.int32())))
+    yield attempt(renamed, pa.list_(pa.field("b", pa.int32())), "list to another item name")
+
+
+_REGISTRY.append(("NestedTypes", nested_types))
+
+
+def float_parsing():
+    """Beyond the C++ tests: `nan` with an n-char sequence, which fast_float
+    parses, among other special values, from every string and binary type."""
+    for source in [pa.utf8(), pa.large_utf8(), pa.binary(), pa.large_binary(), pa.string_view(), pa.binary_view()]:
+        for target in [pa.float32(), pa.float64()]:
+            for text in ["nan(payload)", "-nan(foo)", "+nan()", "NAN(123)", "nan(_a1)", "nan(a-b)", "nan(", "nan)", "nan(a)b", "nan", "-inf", "infinity"]:
+                value = text.encode() if source in (pa.binary(), pa.large_binary(), pa.binary_view()) else text
+                for options in [{}, UNSAFE]:
+                    yield attempt(pa.array([value, None], source), target, f"{text!r} as {source}", **options)
+
+
+_REGISTRY.append(("FloatParsing", float_parsing))
+
+
+def byte_capacity():
+    """Beyond the C++ tests: offsets beyond the 32-bit range, which a 32-bit
+    offset or view type cannot hold. The large binary and string inputs map
+    a sparse file, so no value is written or read."""
+    import struct
+    import tempfile
+
+    end = 2**31
+    with tempfile.NamedTemporaryFile() as file:
+        file.truncate(end)
+        with pa.memory_map(file.name, "r") as mapped:
+            data = mapped.read_buffer(end)
+            offsets = pa.py_buffer(struct.pack("<qq", end, end))
+            for source, targets in [
+                (pa.large_binary(), [pa.binary(), pa.binary_view(), pa.utf8(), pa.string_view()]),
+                (pa.large_utf8(), [pa.utf8(), pa.string_view(), pa.binary(), pa.binary_view()]),
+            ]:
+                array = pa.Array.from_buffers(source, 1, [pa.py_buffer(b"\x00"), offsets, data], null_count=1)
+                for target in targets:
+                    yield exact(array, target, f"null {source} ending at 2^31 to {target}")
+    lists = pa.LargeListArray.from_arrays(pa.array([0, end], pa.int64()), pa.nulls(end))
+    yield exact(lists, pa.list_(pa.null()), "large list ending at 2^31 to a list")
+
+
+_REGISTRY.append(("ByteCapacity", byte_capacity))
+
+
+def decimal_to_real():
+    """Beyond the C++ tests: decimal to floating point arithmetic, which
+    Arrow C++ does in the target width, splitting whole and fraction."""
+    for make, precision in [(pa.decimal32, 9), (pa.decimal64, 18), (pa.decimal128, 38), (pa.decimal256, 76)]:
+        for target in [pa.float32(), pa.float64()]:
+            for text in ["0.3", "1677721.7", "16777217", "0.1"]:
+                for options in [{}, dict(allow_float_truncate=True), dict(allow_decimal_truncate=True)]:
+                    values = [decimal.Decimal(text), None, decimal.Decimal("-" + text)]
+                    yield attempt(pa.array(values, make(precision, 1)), target, f"{text} as {make(precision, 1)} to {target}", **options)
+        yield attempt(pa.array([decimal.Decimal("123.456789")], make(9, 6)), pa.float64(), f"six digit fraction as {make(9, 6)}")
+        yield attempt(pa.array([decimal.Decimal(500)], make(1, -2)), pa.float64(), f"negative scale {make(1, -2)}")
+    for make in [pa.decimal64, pa.decimal128, pa.decimal256]:
+        yield attempt(pa.array([decimal.Decimal("9007199254740993.1")], make(18, 1)), pa.float64(), f"split whole and fraction of {make(18, 1)}")
+        yield attempt(pa.array([decimal.Decimal("9007199254740993.1")], make(18, 1)), pa.float32(), f"split whole and fraction of {make(18, 1)} to float32")
+    for make in [pa.decimal128, pa.decimal256]:
+        yield attempt(pa.array([decimal.Decimal("123456789012345678901234567.8")], make(28, 1)), pa.float64(), f"high bits of {make(28, 1)}")
+        yield attempt(pa.array([decimal.Decimal("123456789012345678901234567.8")], make(28, 1)), pa.float32(), f"high bits of {make(28, 1)} to float32")
+    yield attempt(pa.array([decimal.Decimal("1" * 70 + ".5")], pa.decimal256(72, 1)), pa.float64(), "decimal256 of 70 whole digits")
+
+
+_REGISTRY.append(("DecimalToReal", decimal_to_real))
+
+
+def decimal_precision():
+    """Beyond the C++ tests: the signed minimum of a 32-bit working width,
+    which Arrow C++ `Decimal32::FitsInPrecision` refuses."""
+    for make in [pa.decimal64, pa.decimal128, pa.decimal256]:
+        for value in [2147483648, -2147483648, 2147483647, 2147483649, 4294967296]:
+            for options in [{}, dict(allow_decimal_truncate=True)]:
+                values = [decimal.Decimal(value), None]
+                yield attempt(pa.array(values, make(10, 0)), pa.decimal32(9, 0), f"{value} as {make(10, 0)}", **options)
+    yield attempt(pa.array(["2147483648", "-2147483648"]), pa.decimal32(9, 0), "string of the 32-bit minimum")
+
+
+_REGISTRY.append(("DecimalPrecision", decimal_precision))
+
+
+def zone_offsets():
+    """Beyond the C++ tests: the fixed offset time zone grammar of Arrow C++
+    `LocateZone`, for the casts that read the zone."""
+    for zone in ["+01", "+0060", "+00:60", "+2400", "-1", "+01:0", "+010", "+0100", "+01:00", "-23:59", "+00:00"]:
+        for target in [pa.date32(), pa.date64(), pa.time32("s"), pa.time64("ns"), pa.utf8()]:
+            timestamps = pa.array([0, None, 1], pa.timestamp("s", tz=zone))
+            yield attempt(timestamps, target, f"timestamp in {zone} to {target}")
+
+
+_REGISTRY.append(("ZoneOffsets", zone_offsets))
+
+
+def decimal_formatting():
+    """Beyond the C++ tests: a decimal whose scale is beyond the width's
+    maximum, which Arrow C++ formats as a sentinel."""
+    for make, width, max_scale in [(pa.decimal32, 32, 9), (pa.decimal64, 64, 18), (pa.decimal128, 128, 38), (pa.decimal256, 256, 76)]:
+        for target in [pa.utf8(), pa.large_utf8(), pa.string_view()]:
+            for scale in [-max_scale - 1, -max_scale]:
+                text = f"<scale out of range, cannot format Decimal{width} value>" if scale < -max_scale else f"0E+{max_scale}"
+                source = pa.array([decimal.Decimal(0), None], make(1, scale))
+                yield check(source, pa.array([text, None], target), f"{source.type} to {target}")
+
+
+_REGISTRY.append(("DecimalFormatting", decimal_formatting))
+
+
 def cases():
     """Every `(C++ test, case number, Case)` of the corpus."""
     for name, function in _REGISTRY:

@@ -67,6 +67,7 @@ fn category(error: &ArrowError) -> String {
         ArrowError::NotYetImplemented(_) => "NotImplemented".to_string(),
         ArrowError::CastError(_) => "Invalid".to_string(),
         ArrowError::SchemaError(_) => "TypeError".to_string(),
+        ArrowError::OffsetOverflowError(_) => "ArrowCapacityError".to_string(),
         other => format!("unmapped Rust error {other:?}"),
     }
 }
@@ -88,6 +89,16 @@ fn conversion_options(flags: &Bound<PyDict>) -> PyResult<ConversionOptions> {
     })
 }
 
+/// An array for a report. Either side may hold data whose typed form would
+/// panic or misprint, such as list offsets that decrease or invalid UTF8
+/// behind nulls, so such arrays print as their raw data.
+fn formatted(data: &ArrayData) -> String {
+    match data.validate_full() {
+        Ok(()) => format!("{:?}", make_array(data.clone())),
+        Err(_) => format!("{data:?}"),
+    }
+}
+
 /// Why the Rust outcome differs from the reference outcome, if it does.
 fn mismatch(
     rust: &Result<ArrayData, ArrowError>,
@@ -105,9 +116,9 @@ fn mismatch(
                 ))
             } else if actual != expected {
                 Some(format!(
-                    "values {:?} != reference {:?}",
-                    make_array(actual.clone()),
-                    make_array(expected.clone())
+                    "values {} != reference {}",
+                    formatted(actual),
+                    formatted(expected)
                 ))
             } else {
                 None
@@ -115,8 +126,8 @@ fn mismatch(
         }
         (Ok(_), None) if kind == "supported" => None,
         (Ok(actual), None) => Some(format!(
-            "converted to {:?}, reference refused with {kind}: {message}",
-            make_array(actual.clone())
+            "converted to {}, reference refused with {kind}: {message}",
+            formatted(actual)
         )),
         (Err(error), Some(_)) => Some(format!("refused with {error}, reference converted")),
         (Err(error), None) if kind == "supported" => (category(error) == "NotImplemented")
