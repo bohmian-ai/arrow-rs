@@ -1765,6 +1765,40 @@ def safe_boundaries():
 _REGISTRY.append(("SafeBoundaries", safe_boundaries))
 
 
+def extension_context():
+    """Beyond the C++ tests: extension types nested in another type, and
+    empty casts to and from an extension type, compared with the Arrow C++
+    outcome of the identical input."""
+    offsets = pa.array([0, 3], pa.int32())
+    tiny = pa.ListArray.from_arrays(offsets, tinyint("[0, 1, 3]"))
+    small = pa.ListArray.from_arrays(offsets, smallint("[0, 1, 3]"))
+    for to in [pa.list_(SMALLINT), pa.large_list(SMALLINT), pa.list_(SMALLINT, 3)]:
+        yield attempt(tiny, to, "list of tinyint to another extension")
+        yield Case(tiny.slice(0, 0), to, {}, None, "empty list of tinyint to another extension", variants=False)
+    yield attempt(small, pa.list_(SMALLINT), "list of smallint to the same extension")
+    yield attempt(small, pa.list_(pa.int16()), "list of smallint to its storage")
+    yield attempt(small, pa.list_(pa.int32()), "list of smallint to a wider integer")
+    yield attempt(J(pa.list_(pa.int8()), "[[0, 1, 3]]"), pa.list_(SMALLINT), "list of int8 to an extension")
+    yield attempt(pa.FixedSizeListArray.from_arrays(tinyint("[0, 1, 3]"), 3), pa.list_(SMALLINT), "fixed size list of tinyint to another extension")
+    yield attempt(pa.StructArray.from_arrays([tinyint("[0, 1]")], ["x"]), pa.struct([("x", SMALLINT)]), "struct of tinyint to another extension")
+    yield attempt(pa.StructArray.from_arrays([smallint("[0, 1]")], ["x"]), pa.struct([("x", SMALLINT)]), "struct of smallint to the same extension")
+    entries = pa.MapArray.from_arrays(pa.array([0, 1], pa.int32()), pa.array(["a"]), tinyint("[1]"))
+    yield attempt(entries, pa.map_(pa.utf8(), SMALLINT), "map of tinyint to another extension")
+    yield attempt(entries, pa.list_(pa.struct([("k", pa.utf8()), ("v", SMALLINT)])), "map of tinyint to a list of another extension")
+    struct = pa.struct([("x", pa.int8())])
+    yield attempt(J(struct, "[[1]]"), SMALLINT, "struct to an extension")
+    yield attempt(J(struct, "[[1]]"), pa.int16(), "struct to the storage of an extension")
+    for from_type in [*REGISTRATION_TYPES, TINYINT]:
+        yield Case(pa.nulls(0, from_type), SMALLINT, {}, None, f"empty {from_type} to an extension", variants=False)
+        yield Case(pa.nulls(0, from_type), pa.int16(), {}, None, f"empty {from_type} to the storage of an extension", variants=False)
+    for to in REGISTRATION_TYPES:
+        yield Case(smallint("[]"), to, {}, None, f"empty extension to {to}", variants=False)
+        yield attempt(smallint("[1]"), to, f"extension to {to}")
+
+
+_REGISTRY.append(("ExtensionContext", extension_context))
+
+
 def cases():
     """Every `(C++ test, case number, Case)` of the corpus."""
     for name, function in _REGISTRY:
