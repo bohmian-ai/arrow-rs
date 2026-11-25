@@ -908,7 +908,8 @@ impl ConversionOptions {
 /// support the conversion, [`ArrowError::SchemaError`] when the structure of
 /// `to_type` does not fit the array's (C++ `TypeError`), such as a struct
 /// field with no source or a fixed size list of another size, and
-/// [`ArrowError::CastError`] when a value cannot be converted under `options`.
+/// [`ArrowError::CastError`] when a value cannot be converted under `options`
+/// or a non-nullable item, entry or field of `to_type` would hold a null.
 pub fn cast_with_conversion_options(
     array: &dyn Array,
     to_type: &DataType,
@@ -926,6 +927,17 @@ pub fn cast_with_conversion_options(
             conversion: Some(*options),
         },
     )
+    .map_err(invalid_result)
+}
+
+/// Arrow C++ refuses a nested result that a non-nullable item, entry or field
+/// cannot hold as `Invalid`; the arrow-rs constructors that validate a cast's
+/// result report it as [`ArrowError::InvalidArgumentError`].
+fn invalid_result(error: ArrowError) -> ArrowError {
+    match error {
+        ArrowError::InvalidArgumentError(message) => ArrowError::CastError(message),
+        error => error,
+    }
 }
 
 /// Cast `array`, of the type and extension type of `from`, to the type and
@@ -975,6 +987,7 @@ pub fn cast_field_with_conversion_options(
             conversion: Some(*options),
         },
     )
+    .map_err(invalid_result)
 }
 
 /// Casts `array`, of the field `from`, to the field `to`: the dispatcher of
@@ -9024,9 +9037,8 @@ mod tests {
     #[test]
     fn test_conversion_cast_empty_zone_is_no_zone() {
         let zoned = TimestampSecondArray::from(vec![86_400]).with_timezone("");
-        let text =
-            cast_with_conversion_options(&zoned, &DataType::Utf8, &ConversionOptions::SAFE)
-                .unwrap();
+        let text = cast_with_conversion_options(&zoned, &DataType::Utf8, &ConversionOptions::SAFE)
+            .unwrap();
         assert_eq!(text.as_string::<i32>().value(0), "1970-01-02 00:00:00");
         let date =
             cast_with_conversion_options(&zoned, &DataType::Date32, &ConversionOptions::SAFE)

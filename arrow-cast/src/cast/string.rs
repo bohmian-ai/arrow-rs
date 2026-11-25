@@ -828,13 +828,17 @@ fn formatted(array: &dyn Array, to_type: &DataType) -> Result<Option<ArrayRef>, 
                     }
                     return Ok(());
                 };
-                // Its zoned formatter fails on a local year it cannot print.
-                let offset = utc_offset(zone, value, per_second);
+                // Its zoned formatter fails on a local year it cannot print,
+                // which every instant beyond chrono's years is.
+                let refused = || {
+                    ArrowError::CastError(format!(
+                        "Failed formatting timestamp {value}: the local year is out of range"
+                    ))
+                };
+                let offset = utc_offset(zone, value, per_second).ok_or_else(refused)?;
                 let local = value.wrapping_add(offset as i64 * per_second);
                 if !nanoseconds && !in_date_range(local, per_day) {
-                    return Err(ArrowError::CastError(format!(
-                        "Failed formatting timestamp {value}: the local year is out of range"
-                    )));
+                    return Err(refused());
                 }
                 format_date(local.div_euclid(per_day), out);
                 out.push(' ');

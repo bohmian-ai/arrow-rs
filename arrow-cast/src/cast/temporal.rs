@@ -177,6 +177,12 @@ where
 /// Arrow C++ timestamp to date and time of day conversion: each instant is
 /// moved to the local time of `tz`, then floored to its day, or reduced to the
 /// time since its local midnight in the target unit.
+///
+/// # Errors
+///
+/// Returns [`ArrowError::CastError`] for a zone that is not a time zone, an
+/// instant whose offset chrono cannot find, or a local day outside the 32-bit
+/// days Arrow C++ counts, and for a time of day that loses data.
 fn localized_timestamp(
     array: &dyn Array,
     unit: &TimeUnit,
@@ -187,27 +193,44 @@ fn localized_timestamp(
     let tz = zone(tz)?;
     let per_second = per_second(unit);
     let per_day = per_second * 86_400;
-    let local = move |v: i64| match &tz {
-        None => v,
-        Some(tz) => v.wrapping_add(utc_offset(tz, v, per_second) as i64 * per_second),
+    // The local day and time of day of an instant.
+    let local = move |v: i64| -> Result<(i32, i64), ArrowError> {
+        let local = match &tz {
+            None => v,
+            Some(tz) => {
+                let offset = utc_offset(tz, v, per_second).ok_or_else(|| {
+                    ArrowError::CastError(format!(
+                        "Timestamp {v} is outside the range of the time zone database"
+                    ))
+                })?;
+                v.wrapping_add(offset as i64 * per_second)
+            }
+        };
+        let day = i32::try_from(local.div_euclid(per_day)).map_err(|_| {
+            ArrowError::CastError(format!("Timestamp {v} has a local day outside 32 bits"))
+        })?;
+        Ok((day, local.rem_euclid(per_day)))
     };
     let values = retype(array, DataType::Int64)?;
     let values = values.as_primitive::<Int64Type>();
-    let days = |v: i64| local(v).div_euclid(per_day) as i32;
-    let time_of_day = |v: i64| local(v).rem_euclid(per_day);
     let result: ArrayRef = match to_type {
-        DataType::Date32 => Arc::new(values.unary::<_, Int32Type>(days)),
-        DataType::Date64 => Arc::new(values.unary::<_, Int64Type>(|v| days(v) as i64 * 86_400_000)),
+        DataType::Date32 => {
+            Arc::new(values.try_unary::<_, Int32Type, ArrowError>(|v| Ok(local(v)?.0))?)
+        }
+        DataType::Date64 => Arc::new(
+            values
+                .try_unary::<_, Int64Type, ArrowError>(|v| Ok(local(v)?.0 as i64 * 86_400_000))?,
+        ),
         DataType::Time32(to) | DataType::Time64(to) => {
             let (multiply, factor) = unit_conversion(unit, to);
             let wide = matches!(to_type, DataType::Time64(_));
             let scaled: PrimitiveArray<Int64Type> = if multiply {
-                values.unary(|v| time_of_day(v).wrapping_mul(factor))
+                values.try_unary(|v| Ok::<_, ArrowError>(local(v)?.1.wrapping_mul(factor)))?
             } else if conversion.allow_time_truncate {
-                values.unary(|v| time_of_day(v) / factor)
+                values.try_unary(|v| Ok::<_, ArrowError>(local(v)?.1 / factor))?
             } else {
                 values.try_unary(|v| {
-                    let time = time_of_day(v);
+                    let time = local(v)?.1;
                     if time % factor != 0 {
                         return Err(ArrowError::CastError(format!(
                             "Cast would lose data: {time}"
@@ -234,21 +257,22 @@ fn localized_timestamp(
 /// Returns [`ArrowError::CastError`] for a name that is not a time zone.
 pub(crate) fn zone(tz: Option<&str>) -> Result<Option<Tz>, ArrowError> {
     // Arrow C++ reads an empty time zone as none.
-    tz.filter(|tz| !tz.is_empty()).map(|tz| {
-        let refused = |error: String| {
-            ArrowError::CastError(format!("Cannot locate or parse timezone '{tz}': {error}"))
-        };
-        match tz.strip_prefix(['+', '-']) {
-            Some(offset) => {
-                let (hours, minutes) =
-                    cpp_offset(tz.len(), offset).ok_or_else(|| refused("not an offset".into()))?;
-                format!("{}{hours:02}:{minutes:02}", &tz[..1]).parse::<Tz>()
+    tz.filter(|tz| !tz.is_empty())
+        .map(|tz| {
+            let refused = |error: String| {
+                ArrowError::CastError(format!("Cannot locate or parse timezone '{tz}': {error}"))
+            };
+            match tz.strip_prefix(['+', '-']) {
+                Some(offset) => {
+                    let (hours, minutes) = cpp_offset(tz.len(), offset)
+                        .ok_or_else(|| refused("not an offset".into()))?;
+                    format!("{}{hours:02}:{minutes:02}", &tz[..1]).parse::<Tz>()
+                }
+                None => tz.parse::<Tz>(),
             }
-            None => tz.parse::<Tz>(),
-        }
-        .map_err(|error| refused(error.to_string()))
-    })
-    .transpose()
+            .map_err(|error| refused(error.to_string()))
+        })
+        .transpose()
 }
 
 /// The hours and minutes of the offset of the zone `+offset` or `-offset`,
@@ -275,9 +299,10 @@ fn cpp_offset(len: usize, offset: &str) -> Option<(u8, u8)> {
 }
 
 /// The offset from UTC in seconds of `tz` at the instant `value`, counted in
-/// units of which `per_second` make a second.
-pub(crate) fn utc_offset(tz: &Tz, value: i64, per_second: i64) -> i32 {
-    DateTime::from_timestamp(value.div_euclid(per_second), 0).map_or(0, |utc| {
+/// units of which `per_second` make a second, or `None` outside the years
+/// chrono represents.
+pub(crate) fn utc_offset(tz: &Tz, value: i64, per_second: i64) -> Option<i32> {
+    DateTime::from_timestamp(value.div_euclid(per_second), 0).map(|utc| {
         tz.offset_from_utc_datetime(&utc.naive_utc())
             .fix()
             .local_minus_utc()
