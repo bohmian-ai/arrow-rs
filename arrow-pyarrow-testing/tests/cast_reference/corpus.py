@@ -122,6 +122,7 @@ class Case:
         self.expect = expect
         self.label = label
         self.variants = variants
+        self.exception = None
 
 
 def check(input, expected, label="", **options):
@@ -142,6 +143,23 @@ def type_error(input, to, label="", **options):
 
 def attempt(input, to, label="", **options):
     return Case(input, to, options, None, label or "attempt")
+
+
+# Why an approved exception lets Rust refuse as `Invalid` where Arrow C++ converts.
+INVALID_UTF8_STRINGS = (
+    "approved exception: Arrow C++ converts to strings that fail ValidateFull, "
+    "which a Rust string array cannot soundly hold, so Rust refuses them "
+    "whatever allow_invalid_utf8 is"
+)
+
+
+def excepted(input, to, label, reason, **options):
+    """A C++ cast for which an approved exception lets Rust refuse as
+    `Invalid` where Arrow C++ converts, for `reason`. Any other difference is
+    still a disagreement."""
+    case = Case(input, to, options, None, label)
+    case.exception = reason
+    return case
 
 
 _REGISTRY = []
@@ -1051,10 +1069,8 @@ def _():
             yield check(pa.array([], bin_type), pa.array([], string_type))
             yield check(mask_nulls_at(invalid_utf8(bin_type), [4]), mask_nulls_at(invalid_utf8(string_type), [4]))
             yield fails(invalid_utf8(bin_type), string_type)
-            # Arrow C++ converts to strings that fail ValidateFull, which a
-            # Rust string array cannot hold: see ConversionOptions::allow_invalid_utf8.
-            yield attempt(invalid_utf8(bin_type), string_type, "allow invalid utf8", allow_invalid_utf8=True)
-            yield attempt(invalid_utf8(bin_type), string_type, "unsafe", **UNSAFE)
+            yield excepted(invalid_utf8(bin_type), string_type, "allow invalid utf8", INVALID_UTF8_STRINGS, allow_invalid_utf8=True)
+            yield excepted(invalid_utf8(bin_type), string_type, "unsafe", INVALID_UTF8_STRINGS, **UNSAFE)
     from_type = pa.binary(3)
     for string_type in STRING_TYPES:
         yield check(pa.array([], from_type), pa.array([], string_type))
@@ -1063,8 +1079,8 @@ def _():
             mask_nulls_at(invalid_utf8(string_type, FIXED_SIZE_INVALID_UTF8), [4]),
         )
         yield fails(invalid_utf8(from_type, FIXED_SIZE_INVALID_UTF8), string_type)
-        yield attempt(invalid_utf8(from_type, FIXED_SIZE_INVALID_UTF8), string_type, "allow invalid utf8", allow_invalid_utf8=True)
-        yield attempt(invalid_utf8(from_type, FIXED_SIZE_INVALID_UTF8), string_type, "unsafe", **UNSAFE)
+        yield excepted(invalid_utf8(from_type, FIXED_SIZE_INVALID_UTF8), string_type, "allow invalid utf8", INVALID_UTF8_STRINGS, allow_invalid_utf8=True)
+        yield excepted(invalid_utf8(from_type, FIXED_SIZE_INVALID_UTF8), string_type, "unsafe", INVALID_UTF8_STRINGS, **UNSAFE)
 
 
 @cpp_test("BinaryOrStringToBinary")

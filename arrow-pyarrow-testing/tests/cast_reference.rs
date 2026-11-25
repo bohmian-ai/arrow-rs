@@ -45,8 +45,8 @@ use pyo3::types::{PyDict, PyList};
 
 /// One execution of `harness.executions`: the C++ test, case, variant, input,
 /// the fields of the input, target and reference result types, option flags,
-/// reference status, reference result, reference message and translation
-/// error.
+/// reference status, reference result, reference message, translation error
+/// and approved exception.
 type Execution<'py> = (
     String,
     String,
@@ -57,6 +57,7 @@ type Execution<'py> = (
     String,
     Option<Bound<'py, PyAny>>,
     String,
+    Option<String>,
     Option<String>,
 );
 
@@ -152,11 +153,18 @@ fn identity_mismatch(
     })
 }
 
+/// Whether a difference is the one an approved exception permits: Arrow C++
+/// converts and Rust refuses as `Invalid`.
+fn excepted(rust: &Result<ArrayData, ArrowError>, kind: &str) -> bool {
+    kind == "ok" && matches!(rust, Err(error) if category(error) == "Invalid")
+}
+
 #[test]
 fn cast_matches_arrow_cpp_reference() {
     Python::initialize();
     let mut report = String::new();
     let mut failures = Vec::new();
+    let mut exceptions = Vec::new();
     let mut executions = 0;
     Python::attach(|py| -> PyResult<()> {
         let directory = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/cast_reference");
@@ -172,7 +180,7 @@ fn cast_matches_arrow_cpp_reference() {
 
         for execution in harness.call_method0("executions")?.try_iter()? {
             let execution = execution?;
-            let (test, case, variant, input, (from_field, to_field, result_field), flags, kind, result, message, translation): Execution =
+            let (test, case, variant, input, (from_field, to_field, result_field), flags, kind, result, message, translation, exception): Execution =
                 execution.extract()?;
             executions += 1;
             let input = ArrayData::from_pyarrow_bound(&input)?;
@@ -193,15 +201,24 @@ fn cast_matches_arrow_cpp_reference() {
                 Ok(_) => "ok".to_string(),
                 Err(error) => category(error),
             };
-            let difference = mismatch(&rust, &kind, reference.as_ref(), &message)
+            let mut difference = mismatch(&rust, &kind, reference.as_ref(), &message)
                 .or_else(|| identity_mismatch(&rust, &to_field, result_field.as_ref()));
+            let permitted = exception.is_some() && difference.is_some() && excepted(&rust, &kind);
+            if permitted {
+                exceptions.push(format!("{case} [{variant}] to {to}"));
+                difference = None;
+            }
             writeln!(
                 report,
                 "{case} [{variant}] to {to} with {options:?}: reference {kind}, rust {rust_outcome}{}",
-                difference
-                    .as_ref()
-                    .map(|d| format!(", MISMATCH {d}"))
-                    .unwrap_or_default()
+                match (&difference, permitted) {
+                    (Some(d), _) => format!(", MISMATCH {d}"),
+                    (None, true) => format!(
+                        ", APPROVED EXCEPTION {}",
+                        exception.as_deref().unwrap_or_default()
+                    ),
+                    (None, false) => String::new(),
+                }
             )
             .unwrap();
             if let Some(translation) = translation {
@@ -221,6 +238,11 @@ fn cast_matches_arrow_cpp_reference() {
     if let Ok(path) = std::env::var("CAST_REFERENCE_REPORT") {
         std::fs::write(path, &report).expect("the report path is writable");
     }
+    println!(
+        "{} of {executions} executions differ from Arrow C++ by an approved exception:\n{}",
+        exceptions.len(),
+        exceptions.join("\n")
+    );
     assert!(executions > 0, "the corpus executed no cases");
     assert!(
         failures.is_empty(),
