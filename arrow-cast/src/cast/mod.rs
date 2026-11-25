@@ -1008,6 +1008,20 @@ pub(crate) fn cast_field_with_context(
     if cast_options.conversion.is_some() {
         let source = extension(from);
         let target = extension(to);
+        // Arrow C++ registers a cast from an extension type only to a type it
+        // registers a cast from null to, and to null from null storage.
+        if source.is_some()
+            && target.is_none()
+            && !cpp_registered(&DataType::Null, to.data_type())
+            && !(to.data_type() == &DataType::Null && from.data_type() == &DataType::Null)
+        {
+            return Err(ArrowError::NotYetImplemented(format!(
+                "Unsupported cast from extension type {} over {} to {}",
+                source.map_or("", |(name, _)| name),
+                from.data_type(),
+                to.data_type()
+            )));
+        }
         if array.is_empty() {
             if target.is_some()
                 || (source.is_some() && cpp_registered(&DataType::Null, to.data_type()))
