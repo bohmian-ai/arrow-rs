@@ -1686,6 +1686,31 @@ def registration_sweep():
 _REGISTRY.append(("RegistrationTable", registration_sweep))
 
 
+def safe_boundaries():
+    """Beyond the C++ tests: safe casts at the edges the C++ tests do not
+    reach, compared with the Arrow C++ outcome of the identical input."""
+    two_63, two_64 = 9223372036854775808.0, 18446744073709551616.0
+    for from_type in [pa.float32(), pa.float64()]:
+        yield attempt(J(from_type, [two_63]), pa.int64(), "2^63 to int64")
+        yield attempt(J(from_type, [two_63]), pa.int64(), "2^63 to int64, int overflow allowed", allow_int_overflow=True)
+        yield attempt(J(from_type, [None, two_63]), pa.int64(), "2^63 after a null to int64")
+        yield attempt(mask_nulls_at(J(from_type, [two_63, 1.0]), [0]), pa.int64(), "2^63 behind a null to int64")
+        yield attempt(J(from_type, [-two_63, 0.0, None]), pa.int64(), "-2^63 to int64")
+        yield attempt(J(from_type, [two_64]), pa.uint64(), "2^64 to uint64")
+        yield attempt(J(from_type, [-1.0]), pa.uint64(), "-1 to uint64")
+        yield attempt(J(from_type, [2147483648.0]), pa.int32(), "2^31 to int32")
+    yield attempt(J(pa.float64(), [9223372036854774784.0, None]), pa.int64(), "largest float64 below 2^63 to int64")
+    yield attempt(J(pa.float64(), [18446744073709549568.0, None]), pa.uint64(), "largest float64 below 2^64 to uint64")
+    unknown_zone = pa.array([0, None, 1], pa.int64()).view(pa.timestamp("s", "not-a-timezone"))
+    yield attempt(unknown_zone, pa.int64(), "timestamp with an unknown zone to int64")
+    yield attempt(unknown_zone, pa.timestamp("ms", "not-a-timezone"), "timestamp with an unknown zone to timestamp")
+    yield attempt(unknown_zone, pa.utf8(), "timestamp with an unknown zone to utf8")
+    yield attempt(unknown_zone, pa.date32(), "timestamp with an unknown zone to date32")
+
+
+_REGISTRY.append(("SafeBoundaries", safe_boundaries))
+
+
 def cases():
     """Every `(C++ test, case number, Case)` of the corpus."""
     for name, function in _REGISTRY:

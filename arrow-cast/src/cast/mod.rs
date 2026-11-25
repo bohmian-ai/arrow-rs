@@ -3055,8 +3055,13 @@ where
                 }))
             }
             (false, true) if !conversion.allow_float_truncate => {
+                // `as_` saturates, and the saturated maximum of a 64 bit
+                // integer can round back to the out of range float, so the
+                // range is checked before the value.
                 Some(Box::new(|value: T::Native, out: R::Native| {
-                    if value.to_f64() == out.to_f64() {
+                    if num_cast::<T::Native, R::Native>(value).is_some()
+                        && value.to_f64() == out.to_f64()
+                    {
                         Ok(())
                     } else {
                         Err(ArrowError::CastError(format!(

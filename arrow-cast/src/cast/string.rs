@@ -665,6 +665,10 @@ pub(crate) fn conversion_format(
 fn formatted(array: &dyn Array, to_type: &DataType) -> Result<Option<ArrayRef>, ArrowError> {
     use DataType::*;
     use std::fmt::Write;
+    // Only a string target formats, so no other target reads the time zone.
+    if !matches!(to_type, Utf8 | LargeUtf8 | Utf8View) {
+        return Ok(None);
+    }
     type Format<'a> = Box<dyn Fn(usize, &mut String) + 'a>;
     fn integer<T: ArrowPrimitiveType>(array: &dyn Array) -> Format<'_>
     where
