@@ -379,7 +379,7 @@ pub(crate) fn cast_binary_to_string<O: OffsetSizeTrait>(
 /// # Errors
 ///
 /// [`ArrowError::CastError`] naming the first invalid value.
-fn refuse_invalid_utf8<'a>(
+pub(crate) fn refuse_invalid_utf8<'a>(
     values: impl Iterator<Item = Option<&'a [u8]>>,
 ) -> Result<(), ArrowError> {
     for (index, value) in values.enumerate() {

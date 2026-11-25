@@ -2158,7 +2158,19 @@ pub(crate) fn cast_with_context(
         },
         (FixedSizeBinary(_), Utf8 | LargeUtf8 | Utf8View) if cast_options.conversion.is_some() => {
             // Arrow C++ validates the bytes as UTF-8, as a binary to string
-            // cast does.
+            // cast does, and before it checks the capacity of a view.
+            if to_type == &Utf8View {
+                let fixed = array.as_fixed_size_binary();
+                if let Err(capacity) = conversion_fixed_size_binary_capacity(fixed, &BinaryView) {
+                    if cast_options
+                        .conversion
+                        .is_some_and(|conversion| !conversion.allow_invalid_utf8)
+                    {
+                        refuse_invalid_utf8(fixed.iter())?;
+                    }
+                    return Err(capacity);
+                }
+            }
             let binary = match to_type {
                 Utf8 => Binary,
                 LargeUtf8 => LargeBinary,

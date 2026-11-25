@@ -2132,6 +2132,19 @@ def error_categories():
             # start at 2^31 and wrap, an invalid array, so only views compare.
             for target in [pa.binary_view(), pa.string_view()]:
                 yield exact(fixed.slice(length - 1, 1), target, f"last value of {fixed.type} to {target}")
+    # Arrow C++ validates UTF-8 before it checks view capacity, so invalid
+    # bytes refuse a string view as Invalid, unless invalid UTF-8 is allowed,
+    # and a binary view as CapacityError.
+    with tempfile.NamedTemporaryFile() as file:
+        file.write(b"\xff")
+        file.truncate(width * length)
+        file.flush()
+        with pa.memory_map(file.name, "r") as mapped:
+            data = mapped.read_buffer(width * length)
+            fixed = pa.Array.from_buffers(pa.binary(width), length, [None, data])
+            for target in [pa.binary_view(), pa.string_view()]:
+                yield exact(fixed, target, f"{length} values of {fixed.type} starting 0xff to {target}")
+            yield exact(fixed, pa.string_view(), f"{length} values of {fixed.type} starting 0xff to string_view, unsafe", **UNSAFE)
 
 
 _REGISTRY.append(("ErrorCategories", error_categories))
