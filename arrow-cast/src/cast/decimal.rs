@@ -1233,8 +1233,22 @@ where
             Ok(whole)
         }
     };
+    // Arrow C++ narrows the target bounds to a 32 or 64 bit decimal's width.
+    // A maximum that does not fit wraps to -1 and its minimum to 0, so the
+    // range is empty and every value is out of bounds.
+    let target_width = T::Native::get_byte_width();
+    let bounds_wrap = D::BYTE_LENGTH <= 8
+        && (target_width > D::BYTE_LENGTH
+            || (target_width == D::BYTE_LENGTH && T::DATA_TYPE.is_unsigned_integer()));
+    let refuse_all = bounds_wrap && !conversion.allow_int_overflow;
     let result = array.try_unary::<_, T, _>(|v| {
         let whole = rescale(v)?;
+        if refuse_all {
+            return Err(ArrowError::CastError(format!(
+                "Integer value {whole:?} out of bounds of {}",
+                T::DATA_TYPE
+            )));
+        }
         match <T::Native as NumCast>::from::<D::Native>(whole) {
             Some(value) => Ok(value),
             None if conversion.allow_int_overflow => Ok(T::Native::usize_as(whole.as_usize())),
