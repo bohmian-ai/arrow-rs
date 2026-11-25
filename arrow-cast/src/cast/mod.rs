@@ -2154,14 +2154,19 @@ pub(crate) fn cast_with_context(
             let binary = cast_with_context(array, &binary, cast_options)?;
             cast_with_context(binary.as_ref(), to_type, cast_options)
         }
-        (FixedSizeBinary(size), _) => match to_type {
-            Binary => cast_fixed_size_binary_to_binary::<i32>(array, *size),
-            LargeBinary => cast_fixed_size_binary_to_binary::<i64>(array, *size),
-            BinaryView => cast_fixed_size_binary_to_binary_view(array, *size),
-            _ => Err(ArrowError::CastError(format!(
-                "Casting from {from_type} to {to_type} not supported",
-            ))),
-        },
+        (FixedSizeBinary(size), _) => {
+            if cast_options.conversion.is_some() {
+                conversion_fixed_size_binary_capacity(array.as_fixed_size_binary(), to_type)?;
+            }
+            match to_type {
+                Binary => cast_fixed_size_binary_to_binary::<i32>(array, *size),
+                LargeBinary => cast_fixed_size_binary_to_binary::<i64>(array, *size),
+                BinaryView => cast_fixed_size_binary_to_binary_view(array, *size),
+                _ => Err(ArrowError::CastError(format!(
+                    "Casting from {from_type} to {to_type} not supported",
+                ))),
+            }
+        }
         (BinaryView, Binary) => cast_view_to_byte::<BinaryViewType, GenericBinaryType<i32>>(array),
         (BinaryView, LargeBinary) => {
             cast_view_to_byte::<BinaryViewType, GenericBinaryType<i64>>(array)
@@ -3616,6 +3621,47 @@ fn cast_binary_to_fixed_size_binary<O: OffsetSizeTrait>(
 
 /// Helper function to cast from 'FixedSizeBinaryArray' to one `BinaryArray` or 'LargeBinaryArray'.
 /// If the target one is too large for the source array it will return an Error.
+/// Refuses a fixed size binary array whose values a binary or binary view
+/// target cannot address, as Arrow C++ does before it converts any value: a
+/// binary target addresses `width * length` bytes with 32-bit offsets, and a
+/// view target addresses the last value, counted from the start of the data
+/// buffer, with a 32-bit offset.
+///
+/// # Errors
+///
+/// [`ArrowError::CastError`] (C++ `Invalid`) for a binary target and
+/// [`ArrowError::OffsetOverflowError`] (C++ `CapacityError`) for a view
+/// target.
+fn conversion_fixed_size_binary_capacity(
+    array: &FixedSizeBinaryArray,
+    to_type: &DataType,
+) -> Result<(), ArrowError> {
+    let width = array.value_length() as i64;
+    let length = array.len() as i64;
+    if to_type != &DataType::BinaryView {
+        if to_type == &DataType::Binary && width * length > i32::MAX as i64 {
+            return Err(ArrowError::CastError(format!(
+                "Failed casting from {} to {to_type}: input array too large",
+                array.data_type()
+            )));
+        }
+        return Ok(());
+    }
+    // The buffer starts at the array's offset, in whole values.
+    let offset = if width > 0 {
+        array.values().ptr_offset() as i64 / width
+    } else {
+        0
+    };
+    let total = offset + length;
+    if total > 0 && (total - 1) * width > i32::MAX as i64 {
+        return Err(ArrowError::OffsetOverflowError(
+            (total - 1) as usize * width as usize,
+        ));
+    }
+    Ok(())
+}
+
 fn cast_fixed_size_binary_to_binary<O: OffsetSizeTrait>(
     array: &dyn Array,
     byte_width: i32,
