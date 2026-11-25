@@ -937,8 +937,11 @@ pub fn cast_with_conversion_options(
 /// over a storage type, so `from` and `to` carry what `DataType` does not. As
 /// in Arrow C++, an extension array converts as its storage, a conversion to
 /// an extension type converts to its storage type and the result is of `to`,
-/// and a conversion from one extension type to another is refused. The result
-/// holds the storage of `to`.
+/// and a conversion from one extension type to another is refused. The items,
+/// entries and fields a nested cast converts are cast by their fields in the
+/// same way. An empty input converts to an empty array whenever Arrow C++
+/// registers the extension cast, even if it registers no cast between the
+/// storage types. The result holds the storage of `to`.
 ///
 /// # Errors
 ///
@@ -959,28 +962,73 @@ pub fn cast_field_with_conversion_options(
             from.data_type()
         )));
     }
+    let cast_options = CastOptions {
+        safe: false,
+        format_options: FormatOptions::default(),
+    };
+    cast_field_with_context(
+        array,
+        from,
+        to,
+        &CastContext {
+            options: &cast_options,
+            conversion: Some(*options),
+        },
+    )
+}
+
+/// Casts `array`, of the field `from`, to the field `to`: the dispatcher of
+/// every cast whose source and target fields are known, including the items,
+/// entries and fields a nested cast converts, so an extension type nested in
+/// another type is cast as Arrow C++ casts it.
+///
+/// Under the existing cast semantics this is [`cast_with_context`] to the
+/// type of `to`. Under the Arrow C++ conversion policy an extension type is
+/// cast as [`cast_field_with_conversion_options`] describes, and, as Arrow C++
+/// registers a cast to an extension type from every type and a cast from one
+/// to every type it registers a cast from null to, and runs no kernel on an
+/// empty input, an empty input of such a cast converts to an empty array.
+///
+/// # Errors
+///
+/// [`ArrowError::SchemaError`] (C++ `TypeError`) when both fields carry
+/// extension types that differ, and otherwise the errors of
+/// [`cast_with_context`].
+pub(crate) fn cast_field_with_context(
+    array: &dyn Array,
+    from: &Field,
+    to: &Field,
+    cast_options: &CastContext,
+) -> Result<ArrayRef, ArrowError> {
     fn extension(field: &Field) -> Option<(&str, Option<&str>)> {
         field
             .extension_type_name()
             .map(|name| (name, field.extension_type_metadata()))
     }
-    // Arrow C++ does not run the refusing kernel on an empty input.
-    if let (Some(source), Some(target)) = (extension(from), extension(to))
-        && !array.is_empty()
-    {
-        if source == target && from.data_type() == to.data_type() {
-            return Ok(make_array(array.to_data()));
+    if cast_options.conversion.is_some() {
+        let source = extension(from);
+        let target = extension(to);
+        if array.is_empty() {
+            if target.is_some()
+                || (source.is_some() && cpp_registered(&DataType::Null, to.data_type()))
+            {
+                return Ok(new_empty_array(to.data_type()));
+            }
+        } else if let (Some(source), Some(target)) = (source, target) {
+            if source == target && from.data_type() == to.data_type() {
+                return Ok(make_array(array.to_data()));
+            }
+            return Err(ArrowError::SchemaError(format!(
+                "Casting from extension type {} over {} to different extension type {} over {} \
+                 not permitted. One can first cast to the storage type, then to the extension type.",
+                source.0,
+                from.data_type(),
+                target.0,
+                to.data_type()
+            )));
         }
-        return Err(ArrowError::SchemaError(format!(
-            "Casting from extension type {} over {} to different extension type {} over {} \
-             not permitted. One can first cast to the storage type, then to the extension type.",
-            source.0,
-            from.data_type(),
-            target.0,
-            to.data_type()
-        )));
     }
-    cast_with_conversion_options(array, to.data_type(), options)
+    cast_with_context(array, to.data_type(), cast_options)
 }
 
 /// The options of one cast and the conversion policy its entry point
@@ -1274,7 +1322,10 @@ pub(crate) fn cast_with_context(
                 ));
             }
             let array = array.as_fixed_size_list();
-            let values = cast_with_context(array.values(), list_to.data_type(), cast_options)?;
+            let FixedSizeList(list_from, _) = from_type else {
+                unreachable!("a fixed size list array has a fixed size list type")
+            };
+            let values = cast_field_with_context(array.values(), list_from, list_to, cast_options)?;
             Ok(Arc::new(FixedSizeListArray::try_new(
                 list_to.clone(),
                 *size_from,
@@ -2826,7 +2877,7 @@ fn conversion_struct_to_struct(
                     to_field.data_type()
                 )));
             }
-            cast_with_context(values, to_field.data_type(), cast_options)
+            cast_field_with_context(values, from_field, to_field, cast_options)
         })
         .collect::<Result<Vec<_>, _>>()?;
     let array = StructArray::try_new_with_length(

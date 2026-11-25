@@ -37,8 +37,10 @@ pub(crate) fn cast_map_values(
         "map is missing value field".to_string(),
     ))?;
 
-    let key_array = cast_with_context(from.keys(), key_field.data_type(), cast_options)?;
-    let value_array = cast_with_context(from.values(), value_field.data_type(), cast_options)?;
+    let entries = from.entries().fields();
+    let key_array = cast_field_with_context(from.keys(), &entries[0], &key_field, cast_options)?;
+    let value_array =
+        cast_field_with_context(from.values(), &entries[1], &value_field, cast_options)?;
 
     Ok(Arc::new(MapArray::try_new(
         entries_field.clone(),
@@ -76,8 +78,9 @@ pub(crate) fn conversion_map_to_list(
             let [key, value] = fields.iter().collect::<Vec<_>>()[..] else {
                 return Err(two_fields(to_type));
             };
-            let keys = cast_with_context(from.keys(), key.data_type(), cast_options)?;
-            let values = cast_with_context(from.values(), value.data_type(), cast_options)?;
+            let entries = from.entries().fields();
+            let keys = cast_field_with_context(from.keys(), &entries[0], key, cast_options)?;
+            let values = cast_field_with_context(from.values(), &entries[1], value, cast_options)?;
             let entries = StructArray::try_new(fields.clone(), vec![keys, values], None)?;
             let list = ListArray::try_new(
                 item.clone(),
