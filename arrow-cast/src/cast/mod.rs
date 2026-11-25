@@ -8954,6 +8954,75 @@ mod tests {
         }
     }
 
+    /// A rescale by more digits than any width holds, which Arrow C++ leaves
+    /// undefined, refuses or converts without panicking.
+    #[test]
+    fn test_conversion_cast_decimal_extreme_scales() {
+        let unsafe_options = ConversionOptions {
+            allow_decimal_truncate: true,
+            allow_int_overflow: true,
+            ..ConversionOptions::SAFE
+        };
+        let types = |scale: i8| {
+            [
+                DataType::Decimal32(9, scale.min(9)),
+                DataType::Decimal64(18, scale.min(18)),
+                DataType::Decimal128(38, scale.min(38)),
+                DataType::Decimal256(76, scale),
+            ]
+        };
+        let decimals = |data_type: &DataType, values: Vec<Option<i8>>| -> ArrayRef {
+            let array: ArrayRef = match data_type {
+                DataType::Decimal32(..) => Arc::new(
+                    values
+                        .into_iter()
+                        .map(|v| v.map(|v| v as i32))
+                        .collect::<Decimal32Array>(),
+                ),
+                DataType::Decimal64(..) => Arc::new(
+                    values
+                        .into_iter()
+                        .map(|v| v.map(|v| v as i64))
+                        .collect::<Decimal64Array>(),
+                ),
+                DataType::Decimal128(..) => Arc::new(
+                    values
+                        .into_iter()
+                        .map(|v| v.map(|v| v as i128))
+                        .collect::<Decimal128Array>(),
+                ),
+                _ => Arc::new(
+                    values
+                        .into_iter()
+                        .map(|v| v.map(|v| i256::from_i128(v as i128)))
+                        .collect::<Decimal256Array>(),
+                ),
+            };
+            make_array(
+                array
+                    .to_data()
+                    .into_builder()
+                    .data_type(data_type.clone())
+                    .build()
+                    .unwrap(),
+            )
+        };
+        for from in types(-128).into_iter().chain(types(76)) {
+            let values = decimals(&from, vec![Some(0), None]);
+            let one = decimals(&from, vec![Some(1)]);
+            for to in types(-128).into_iter().chain(types(76)).chain([
+                DataType::Int64,
+                DataType::Float64,
+                DataType::Utf8,
+            ]) {
+                for options in [&ConversionOptions::SAFE, &unsafe_options] {
+                    let _ = cast_with_conversion_options(&values, &to, options);
+                    let _ = cast_with_conversion_options(&one, &to, options);
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_conversion_cast_decimal_to_integer() {
         let errors = CastOptions {

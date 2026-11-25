@@ -823,6 +823,9 @@ where
 /// A decimal native type whose wrapping arithmetic Arrow C++ uses as the
 /// working width of a decimal to decimal conversion.
 pub(crate) trait WrappingDecimal: ArrowNativeTypeOp {
+    /// The largest power of ten the width holds. Every value of the width
+    /// has fewer digits than ten to one more than this.
+    const MAX_DIGITS: u32;
     /// The value, sign extended.
     fn widen(self) -> i256;
     /// The low bits of `value`.
@@ -841,6 +844,7 @@ pub(crate) trait WrappingDecimal: ArrowNativeTypeOp {
 }
 
 impl WrappingDecimal for i32 {
+    const MAX_DIGITS: u32 = 9;
     fn widen(self) -> i256 {
         i256::from_i128(self as i128)
     }
@@ -853,6 +857,7 @@ impl WrappingDecimal for i32 {
 }
 
 impl WrappingDecimal for i64 {
+    const MAX_DIGITS: u32 = 18;
     fn widen(self) -> i256 {
         i256::from_i128(self as i128)
     }
@@ -865,6 +870,7 @@ impl WrappingDecimal for i64 {
 }
 
 impl WrappingDecimal for i128 {
+    const MAX_DIGITS: u32 = 38;
     fn widen(self) -> i256 {
         i256::from_i128(self)
     }
@@ -874,6 +880,7 @@ impl WrappingDecimal for i128 {
 }
 
 impl WrappingDecimal for i256 {
+    const MAX_DIGITS: u32 = 76;
     fn widen(self) -> i256 {
         self
     }
@@ -974,11 +981,7 @@ where
     let result = array.try_unary::<_, O, _>(|v| {
         let v = W::wrap(v.widen());
         let v = if conversion.allow_decimal_truncate {
-            if delta > 0 {
-                v.mul_wrapping(multiplier)
-            } else {
-                v.div_wrapping(multiplier)
-            }
+            truncating_rescale(v, delta, multiplier)
         } else {
             checked_rescale(
                 v,
@@ -993,6 +996,20 @@ where
         Ok::<_, ArrowError>(O::Native::wrap(v.widen()))
     })?;
     Ok(Arc::new(result.with_precision_and_scale(precision, scale)?))
+}
+
+/// Arrow C++ `Rescale` without a data loss check: `v` multiplied or divided
+/// by `multiplier`, ten to the power of `|delta|`, wrapping. A division by
+/// more digits than the width holds, which Arrow C++ leaves undefined, is
+/// zero.
+fn truncating_rescale<W: WrappingDecimal>(v: W, delta: i32, multiplier: W) -> W {
+    if delta > 0 {
+        v.mul_wrapping(multiplier)
+    } else if delta.unsigned_abs() > W::MAX_DIGITS {
+        W::ZERO
+    } else {
+        v.div_wrapping(multiplier)
+    }
 }
 
 /// Arrow C++ `Rescale` followed by `FitsInPrecision`: `v` multiplied or
@@ -1013,7 +1030,11 @@ fn checked_rescale<W: WrappingDecimal>(
     scale: i8,
     precision: u8,
 ) -> Result<W, ArrowError> {
-    let rescaled = if delta < 0 {
+    let rescaled = if delta.unsigned_abs() > W::MAX_DIGITS {
+        // Arrow C++ reads past its power of ten table here. No value of the
+        // width keeps its digits, so only zero rescales.
+        (v == W::ZERO).then_some(v)
+    } else if delta < 0 {
         (v.mod_wrapping(multiplier) == W::ZERO).then(|| v.div_wrapping(multiplier))
     } else {
         let product = v.mul_wrapping(multiplier);
@@ -1125,9 +1146,10 @@ where
         if negative {
             value = value.neg_wrapping();
         }
-        let mut parsed_scale = fraction_digits.len() as i32 - exponent;
+        // Arrow C++ computes the scale in 32 bits, which wraps.
+        let mut parsed_scale = (fraction_digits.len() as i32).wrapping_sub(exponent);
         if parsed_scale < 0 {
-            if -parsed_scale > D::MAX_SCALE as i32 {
+            if parsed_scale < -(D::MAX_SCALE as i32) {
                 return Err(ArrowError::CastError(format!(
                     "The string '{}' cannot be represented as {}",
                     String::from_utf8_lossy(text),
@@ -1137,16 +1159,12 @@ where
             value = value.mul_wrapping(ten.pow_wrapping((-parsed_scale) as u32));
             parsed_scale = 0;
         }
-        let delta = scale as i32 - parsed_scale;
-        // ponytail: Arrow C++ reads past its power of ten table for a
-        // rescale beyond the maximum scale; this wraps instead.
+        let delta = scale as i64 - parsed_scale as i64;
+        // A delta beyond 32 bits is beyond every width, as its clamp is.
+        let delta = delta.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
         let multiplier = ten.pow_wrapping(delta.unsigned_abs());
         if conversion.allow_decimal_truncate {
-            Ok(if delta > 0 {
-                value.mul_wrapping(multiplier)
-            } else {
-                value.div_wrapping(multiplier)
-            })
+            Ok(truncating_rescale(value, delta, multiplier))
         } else {
             checked_rescale(
                 value,
